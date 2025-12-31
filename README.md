@@ -42,95 +42,74 @@
 
 ```mermaid
 graph TD
-    %% 定义样式
-    classDef user fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef core fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
-    classDef agent fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
-    classDef db fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
-    classDef guard fill:#ffebee,stroke:#c62828,stroke-width:2px,stroke-dasharray: 5 5;
-    classDef obs fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    %% === 样式定义 ===
+    classDef user fill:#2d3436,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef router fill:#0984e3,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef sqlAgent fill:#00b894,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef ragAgent fill:#6c5ce7,stroke:#fff,stroke-width:2px,color:#fff;
+    classDef db fill:#f1c40f,stroke:#e67e22,stroke-width:2px,color:#2d3436;
+    classDef shared fill:#95a5a6,stroke:#fff,stroke-width:1px,color:#fff;
 
-    %% 外部入口
-    User((User / Client)):::user
-    Gateway[API Gateway / Auth Middleware]:::core
-    
-    %% 核心路由层
-    subgraph "🧠 语义路由层 (Semantic Router)"
-        Classifier[Intent Classifier<br/>LLM / Semantic Router]:::core
-        RouteDecision{Decision}
+    %% === 第一层：入口与分发 ===
+    subgraph "Layer 1: 用户入口与路由"
+        User(👱 用户提问 User Query):::user
+        Router{🧠 意图分流 Router}:::router
+        
+        User --> Router
     end
 
-    %% SQL Agent 链路
-    subgraph "📊 SQL Agent (Structured Data)"
-        PermCheck[🔒 权限过滤<br/>RBAC Filter]:::guard
-        SchemaLink[🔍 Schema Linking<br/>Vector Search]:::agent
-        SQLGen[📝 SQL Generation<br/>Text-to-SQL]:::agent
+    %% === 第二层：双 Agent 核心逻辑 ===
+    subgraph "Layer 2: 智能体层 Agent Layer"
+        direction TB
         
-        subgraph "🛡️ 安全护栏"
-            SyntaxCheck[语法检查]:::guard
-            SecurityCheck[DML/DDL 拦截<br/>LIMIT 强制注入]:::guard
+        %% 左侧：SQL Agent
+        subgraph "📊 SQL Agent (查数据)"
+            direction TB
+            S1[1. Schema Linking<br/>只找相关的表]:::sqlAgent
+            S2[2. SQL 生成<br/>Text-to-SQL]:::sqlAgent
+            S3[3. 安全护栏<br/>语法/权限检查]:::sqlAgent
+            S4[4. SQL 执行器<br/>Executor]:::sqlAgent
+            
+            S1 --> S2 --> S3 --> S3_Check{通过?}
+            S3_Check -->|Yes| S4
+            S3_Check -->|No| S_Err[🚫 拒绝/重试]:::sqlAgent
         end
+
+        %% 右侧：RAG Agent
+        subgraph "📄 RAG Agent (查文档)"
+            direction TB
+            R1[1. 混合检索<br/>Keyword + Vector]:::ragAgent
+            R2[2. 重排序<br/>Rerank]:::ragAgent
+            R3[3. 答案生成<br/>LLM + 引用]:::ragAgent
+            
+            R1 --> R2 --> R3
+        end
+    end
+
+    %% === 第三层：基础设施与存储 ===
+    subgraph "Layer 3: 基础设施 Infrastructure"
+        direction TB
         
-        Executor[⚙️ SQL Executor]:::agent
-        DataInterp[💡 结果解释<br/>Data-to-Text]:::agent
+        VectorDB[(🗄️ 向量数据库<br/>ChromaDB / Milvus)]:::db
+        BusinessDB[(💾 业务数据库<br/>MySQL / PG)]:::db
+        Cache[(⚡ Redis 缓存<br/>Schema/Session)]:::shared
     end
 
-    %% Doc RAG 链路
-    subgraph "📄 Doc RAG Agent (Unstructured Data)"
-        DocIngest[📥 Ingestion Pipeline<br/>Hash Check / Chunking]:::agent
-        HybridSearch[🔍 混合检索<br/>BM25 + Embedding]:::agent
-        Rerank[📶 Rerank<br/>重排序]:::agent
-        RefinePrompt[📝 Context Refinement]:::agent
-        DocGen[💡 引用生成<br/>Answer + Citations]:::agent
-    end
-
-    %% 数据存储层
-    subgraph "💾 存储与基础设施"
-        VectorDB[(ChromaDB / Milvus<br/>Schemas & Docs)]:::db
-        BusinessDB[(Business DB<br/>MySQL / PG)]:::db
-        Redis[(Redis Cache)]:::db
-    end
-
-    %% 可观测性侧车
-    subgraph "👀 可观测性 & 审计"
-        Trace[Trace ID 追踪]:::obs
-        AuditLog[审计日志 JSONL]:::obs
-        Feedback[用户反馈 Loop]:::obs
-    end
-
-    %% 连线逻辑
-    User --> Gateway
-    Gateway --> Classifier
-    Classifier -->|Route & Confidence| RouteDecision
-
-    %% 分流逻辑
-    RouteDecision -->|SQL Intent| PermCheck
-    RouteDecision -->|Doc Intent| HybridSearch
-    RouteDecision -->|Ambiguous| Clarify[❓ 追问/澄清]:::core
-
-    %% SQL 流程
-    PermCheck --> SchemaLink
-    SchemaLink <--> VectorDB
-    SchemaLink --> SQLGen
-    SQLGen --> SyntaxCheck
-    SyntaxCheck --> SecurityCheck
-    SecurityCheck -->|Pass| Executor
-    SecurityCheck -->|Block| ErrorHandler[🚫 拒绝执行]:::guard
-    Executor <--> BusinessDB
-    Executor --> DataInterp
-
-    %% RAG 流程
-    HybridSearch <--> VectorDB
-    HybridSearch --> Rerank
-    Rerank --> RefinePrompt
-    RefinePrompt --> DocGen
-
-    %% 输出与监控
-    DataInterp --> Output[最终响应]
-    DocGen --> Output
-    Output --> User
+    %% === 核心链路逻辑 ===
     
-    %% 监控连线
-    Gateway -.-> Trace
-    Executor -.-> AuditLog
-    DocGen -.-> Feedback
+    %% 1. 路由分发
+    Router -->|意图: 统计/查询| S1
+    Router -->|意图: 知识/流程| R1
+
+    %% 2. Agent 与 数据库的交互
+    
+    %% SQL Agent 的交互
+    S1 -.->|检索表结构元数据| VectorDB
+    S4 <-->|执行 SQL 查询| BusinessDB
+    
+    %% RAG Agent 的交互
+    R1 <-->|检索文档切片| VectorDB
+
+    %% 3. 输出
+    S4 --> FinalOutput(📝 最终回复):::user
+    R3 --> FinalOutput
