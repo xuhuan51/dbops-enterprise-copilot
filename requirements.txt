@@ -1,0 +1,22 @@
+# === Web 框架 ===
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.6.0
+pydantic-settings==2.1.0  # 专业的配置管理
+
+# === AI & Agent 编排 ===
+langchain==0.3.7
+langchain-openai==0.0.5
+langgraph==0.0.22         # 核心！循环图编排框架
+langchain-community==0.3.27
+
+# === 向量数据库 ===
+#pymilvus==2.3.5           # Milvus 官方客户端
+# chromadb==0.4.22        # 备注：先留着做备用，暂不开启
+
+# === 数据库与工具 ===
+pymysql>=1.1.0
+redis==5.0.1
+loguru==0.7.2             # 最好用的日志库
+python-dotenv==1.0.0
+requests==2.32.4
