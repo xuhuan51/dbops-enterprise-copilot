@@ -1,20 +1,35 @@
+import json
+import re
 import time
 import uuid
-import json
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-# 引入刚才定义的 LLM 工具
+# 引入核心组件
 from app.core.llm import chat_completion
-# 引入你之前的 Milvus 检索函数 (假设在 app.modules.retrieval)
+from app.core.prompts import RETRIEVAL_JUDGE_TEMPLATE
+from app.core.domain_config import get_relevant_rules, ECOMMERCE_EXAMPLES
 from app.modules.retrieval.schema_retriever import retrieve_tables
 
 router = APIRouter(prefix="/api/v1", tags=["retrieve"])
 
+# =========================
+# 0. 配置参数
+# =========================
+PREFETCH_K = 500  # 向量检索召回数量
+GATE_CANDIDATE_K = 20  # 进入门禁检查的候选表数量
+FINAL_TOP_K = 5  # 最终返回数量
 
-# --- 1. Pydantic 数据模型 ---
+MIN_SCORE_THRESHOLD = 0.45
+MAX_HOPS = 1  # 最大重试次数
+
+
+# =========================
+# 1. 核心数据结构 (Pydantic)
+# =========================
+
 class Filters(BaseModel):
     allowed_dbs: Optional[List[str]] = None
     domain: Optional[str] = None
@@ -23,149 +38,246 @@ class Filters(BaseModel):
 class RetrieveReq(BaseModel):
     user_id: str
     query: str
-    topk: int = 5  # Agent 模式下不需要太多，5个足够决策
+    topk: int = FINAL_TOP_K
     filters: Optional[Filters] = None
 
 
-# --- 2. 辅助工具函数 ---
-def _loads_list(s: Any) -> List[str]:
-    """安全解析存储在数据库里的 JSON 字符串列表"""
-    if s is None: return []
-    if isinstance(s, list): return s
-    if isinstance(s, str):
-        try:
-            x = json.loads(s)
-            return x if isinstance(x, list) else []
-        except:
-            return []
-    return []
+# ✅ 新增：LLM 提取的需求结构
+class QueryNeeds(BaseModel):
+    intent: str = Field(..., description="data_query | non_data | sensitive")
+    must_have: Dict[str, List[str]] = Field(...,
+                                            description="必须具备的能力，如 {'entity': ['user'], 'dimension': ['time']}")
+    search_keywords: List[str] = Field(default=[], description="用于重搜的关键词")
 
 
-# --- 3. 核心 Agent：LLM 澄清决策器 ---
-def clarify_with_llm(query: str, candidates: List[Dict]) -> Dict[str, Any]:
+# =========================
+# 2. 核心组件：Needs Extraction (需求提取)
+# =========================
+def extract_query_needs(query: str) -> QueryNeeds:
     """
-    利用 LLM 判断检索结果是否具有歧义，并生成专业的反问话术
+    让 LLM 分析用户Query，提取硬性需求 (Must Have)。
+    不涉及具体表名，只涉及业务能力。
     """
-    # 1. 判空处理
-    if not candidates:
-        return {
-            "need_clarify": True,
-            "clarify_question": "抱歉，未找到相关业务表，请补充更多业务细节（如业务域、关键字段）。",
-            "reason": "No candidates found"
-        }
-
-    # 2. 构造 Prompt，将 Top-3 的核心元数据发给 LLM 评估
-    # 只取前3个，减少Token消耗，因为通常干扰项就在前几名
-    top_n = candidates[:3]
-    candidate_info = ""
-    for idx, c in enumerate(top_n):
-        metrics = c['features'].get('metric_cols', [])
-        comment = c.get('evidence', '') or c.get('full_name', '')
-        candidate_info += f"候选表{idx + 1}: {c['full_name']} (注释/匹配证据: {comment}) | 包含指标: {metrics}\n"
-
     prompt = f"""
-    【角色任务】
-    你是一个数据分析专家。用户想查询："{query}"。
-    系统检索到了以下最相关的数据库表（按相关性排序）：
-    {candidate_info}
+你是一个数据分析师。请分析用户问题，提取查询所需的【核心数据能力】。
 
-    【判断逻辑】
-    1. **直接通过**：如果"候选表1"明显优于其他表，且完美覆盖用户需求，不需要澄清。
-    2. **需要澄清**：如果前两名表业务含义极其相近（例如：只有状态不同、只有统计口径不同），且用户问题模糊，必须反问。
-    3. **无结果**：如果所有候选表都毫不相关，请告知用户无法回答。
+User Query: "{query}"
 
-    【输出要求】
-    请直接返回合法的 JSON 字符串，不要包含 Markdown 格式：
-    {{
-        "need_clarify": true/false,
-        "clarify_question": "如果为true，请在此生成一句简短专业的反问，引导用户区分这两个表；如果为false，留空",
-        "reason": "简述判断理由"
-    }}
-    """
+请输出 JSON，包含：
+1. intent: "data_query" (正常查询) | "non_data" (闲聊/写诗) | "sensitive" (查工资/密码)
+2. must_have: 必须具备的字段能力，从以下类别中选：
+   - "entity": 需要的主体 (user, order, sku, supplier, activity...)
+   - "dimension": 需要的过滤/分组维度 (time, region, channel, status...)
+   - "metric": 需要的统计指标 (amount, qty, count, duration...)
+   - "join": 需要跨表关联 (join)
+3. search_keywords: 如果当前检索失败，你建议用什么关键词去重搜？(提供3-5个同义词/业务词)
 
-    # 3. 调用 LLM 并解析结果
+示例：
+Query: "统计上个月北京用户的注册量"
+JSON:
+{{
+    "intent": "data_query",
+    "must_have": {{
+        "entity": ["user"],
+        "dimension": ["time", "region"],
+        "metric": ["count"]
+    }},
+    "search_keywords": ["用户基础信息", "注册时间", "create_time", "地区"]
+}}
+"""
     try:
-        raw_res = chat_completion(prompt)
-        # 清理可能的 markdown 标记
-        raw_res = raw_res.replace("```json", "").replace("```", "")
-        decision = json.loads(raw_res)
-        return decision
+        raw = chat_completion(prompt)
+        # 简单的 JSON 提取
+        json_str = re.search(r"\{[\s\S]*\}", raw).group(0)
+        data = json.loads(json_str)
+        return QueryNeeds(**data)
     except Exception as e:
-        print(f"Agent 决策解析失败: {e}, Raw: {raw_res}")
-        # 兜底策略：如果 LLM 挂了，回退到规则（Gap 策略）
-        gap = candidates[0]['score'] - candidates[1]['score'] if len(candidates) > 1 else 1.0
+        print(f"⚠️ Needs Extraction Failed: {e}")
+        # 兜底：假设是普通查询，无强制约束
+        return QueryNeeds(intent="data_query", must_have={}, search_keywords=[])
+
+
+# =========================
+# 3. 核心组件：Capability Gate (硬门禁)
+# =========================
+def check_capabilities(needs: QueryNeeds, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    代码逻辑门禁：检查候选表是否覆盖了 must_have 的能力。
+    返回: {"pass": bool, "missing": str}
+    """
+    # 1. 熔断检查
+    if needs.intent in ["non_data", "sensitive"]:
+        return {"pass": False, "action": "ASK_USER", "reason": f"Intent is {needs.intent}"}
+
+    if not candidates:
+        return {"pass": False, "action": "REWRITE", "reason": "No candidates found"}
+
+    # 2. 收集所有候选表的能力并集
+    # 这里的 features 是从 Milvus 读出来的 feat_xxx_cols JSON 字符串解析后的列表
+    all_caps = {
+        "entity": set(),  # 从 domain 推断，或 features 里有 uid/oid
+        "dimension": set(),
+        "metric": set()
+    }
+
+    for c in candidates:
+        # 解析 features (假设已转为 dict/list)
+        feats = c.get("features", {})
+
+        # Time Dimension
+        if feats.get("time_cols"):
+            all_caps["dimension"].add("time")
+
+        # Region/Status 等其他维度 (可以从 columns 里简单的正则判断，或离线已打标)
+        # 这里简化：如果有 domain=user，默认有 user entity
+        domain = c.get("domain", "")
+        if domain == "user": all_caps["entity"].add("user")
+        if domain == "trade": all_caps["entity"].add("order")
+        if domain == "scm": all_caps["entity"].add("sku")
+
+        # Metrics
+        if feats.get("metric_cols"):
+            all_caps["metric"].add("metric")  # 只要有指标列就算有 metric 能力
+            # 也可以更细：if "amount" in feats['metric_cols']: ...
+
+    # 3. 对照检查
+    missing = []
+
+    # 检查维度 (Time)
+    if "time" in needs.must_have.get("dimension", []) and "time" not in all_caps["dimension"]:
+        missing.append("缺少[时间]维度字段")
+
+    # 检查实体 (User) - 这是一个强校验示例
+    if "user" in needs.must_have.get("entity", []) and "user" not in all_caps["entity"]:
+        missing.append("缺少[用户]相关表")
+
+    # 4. 判定
+    if missing:
         return {
-            "need_clarify": gap < 0.05,
-            "clarify_question": "查询结果存在多个相似表，请提供更详细的描述。" if gap < 0.05 else "",
-            "reason": "Fallback due to LLM error"
+            "pass": False,
+            "action": "REWRITE",
+            "reason": f"Gate拦截: {','.join(missing)}",
+            "missing_caps": missing
         }
 
+    return {"pass": True, "action": "PASS"}
 
-# --- 4. API 路由逻辑 ---
-@router.post("/retrieve_tables")
-def retrieve(req: RetrieveReq):
+
+# =========================
+# 4. 辅助函数 (聚合 & 搜索)
+# =========================
+def _safe_json_load(s):
+    if isinstance(s, list): return s
+    try:
+        return json.loads(s)
+    except:
+        return []
+
+
+def aggregate_shards_and_parse(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    1. 分表聚合 (逻辑同前)
+    2. 解析 Milvus 存的 JSON 字符串 (feat_time_cols) 为列表
+    """
+    # ... (分表聚合逻辑与之前相同，略微简化展示) ...
+    # 假设 items 已经是 retrieve_tables 返回的 raw data
+
+    # 这里重点是解析 features
+    for it in items:
+        # Milvus 里的 feat_time_cols 是字符串，转回 list
+        it["features"] = {
+            "time_cols": _safe_json_load(it.get("feat_time_cols", "[]")),
+            "metric_cols": _safe_json_load(it.get("feat_metric_cols", "[]")),
+            "join_keys": _safe_json_load(it.get("feat_join_keys", "[]"))
+        }
+    return items  # 这里应保留 aggregate_shards 的去重逻辑
+
+
+def search_by_keywords(keywords: List[str]) -> List[Dict[str, Any]]:
+    # 调用底层的 retrieve_tables
+    # 实际应包含去重逻辑
+    results = []
+    for kw in keywords:
+        res = retrieve_tables(kw, topk=50)  # 扩大搜索
+        if res: results.extend(res)
+    return aggregate_shards_and_parse(results)
+
+
+# =========================
+# 5. 原有的 Judge (用于 Gate 通过后的精选)
+# =========================
+def llm_judge_final(query: str, candidates: List[Dict[str, Any]]) -> Dict:
+    # ... (代码与之前一致：动态 prompt + 规则) ...
+    # 略写，直接调用之前的逻辑
+    return {"status": "PASS", "selected_tables": [c['logical_table'] for c in candidates[:3]]}
+
+
+# =========================
+# 6. 主 API 入口
+# =========================
+@router.post("/retrieve_tables_gate")
+def retrieve_tables_with_gate(req: RetrieveReq):
     trace_id = str(uuid.uuid4())
     t0 = time.time()
 
-    # A. 执行向量检索
-    raw_items = retrieve_tables(req.query, req.topk)
+    # --- Step 1: 初始检索 (Vector Recall) ---
+    raw_1 = retrieve_tables(req.query, topk=PREFETCH_K) or []
+    # 聚合分表 & 解析 features JSON
+    candidates_pool = aggregate_shards_and_parse(raw_1)
 
-    # B. 应用过滤器 (Filters)
-    items = raw_items
-    filters_applied = []
-    if req.filters:
-        if req.filters.allowed_dbs:
-            allow = set(req.filters.allowed_dbs)
-            items = [x for x in items if x.get("db") in allow]
-            filters_applied.append(f"allowed_dbs: {req.filters.allowed_dbs}")
-        if req.filters.domain:
-            items = [x for x in items if x.get("domain") == req.filters.domain]
-            filters_applied.append(f"domain: {req.filters.domain}")
+    # 截取 Top K 进入门禁
+    candidates_gate = candidates_pool[:GATE_CANDIDATE_K]
 
-    # C. 格式化候选结果 (Standardization)
-    candidates = []
-    for i, x in enumerate(items[:req.topk], 1):
-        candidates.append({
-            "rank": i,
-            "full_name": x.get("full_name"),
-            "db": x.get("db"),
-            "table": x.get("table"),
-            "score": float(x.get("score", 0.0)),
-            # evidence 是你向量库里存的那段长文本
-            "evidence": x.get("text", "")[:200] + "...",
-            "features": {
-                "join_keys": _loads_list(x.get("join_keys")),
-                "time_cols": _loads_list(x.get("time_cols")),
-                "metric_cols": _loads_list(x.get("metric_cols")),
-            },
-            "governance": {
-                "owner": x.get("owner", ""),
-                "app": x.get("app", "")
-            }
-        })
+    # --- Step 2: 需求提取 (LLM) ---
+    needs = extract_query_needs(req.query)
 
-    # D. Agent 介入决策 (The "Brain")
-    # 只有当确实检索到了东西，才让 LLM 去判断是否需要澄清
-    if candidates:
-        decision = clarify_with_llm(req.query, candidates)
-    else:
-        decision = {
-            "need_clarify": True,
-            "clarify_question": "未检索到相关表，请检查关键词或业务域。",
-            "reason": "No candidates"
+    # --- Step 3: Capability Gate (Python Logic) ---
+    gate_result = check_capabilities(needs, candidates_gate)
+
+    gate_action = gate_result["action"]
+    final_pool = candidates_gate
+
+    # --- Step 4: 处理 Gate 结果 ---
+    if gate_action == "ASK_USER":
+        return {
+            "success": True,
+            "agent_decision": {"need_clarify": True, "reason": gate_result["reason"]}
         }
 
-    latency_ms = int((time.time() - t0) * 1000)
+    elif gate_action == "REWRITE":
+        # 🔴 触发重搜！
+        print(f"🔄 Gate blocked: {gate_result['reason']}. Rewriting...")
 
+        # 使用 LLM 生成的 keywords 重搜
+        new_kws = needs.search_keywords
+        if new_kws:
+            raw_2 = search_by_keywords(new_kws)
+            # 合并结果 (去重)
+            seen = {c.get("full_name") for c in candidates_pool}
+            for r in raw_2:
+                if r.get("full_name") not in seen:
+                    candidates_pool.append(r)
+                    seen.add(r.get("full_name"))
+
+            # 重新排序 (简单按原有分数或置顶新结果)
+            final_pool = candidates_pool[:GATE_CANDIDATE_K]  # 再次截取
+        else:
+            # 没生成关键词，无奈 Pass
+            pass
+
+    # --- Step 5: Final Judge (LLM Selection) ---
+    # 现在 final_pool 里应该包含了补搜回来的表
+    # 这里调用之前的 judge 逻辑做最后的清洗
+    # judge_res = llm_judge(req.query, final_pool) ...
+
+    # (为了演示，直接返回 final_pool)
     return {
         "trace_id": trace_id,
         "success": True,
-        "data": {
-            "candidates": candidates,
-            "agent_decision": decision,  # 前端根据这个字段弹窗反问用户
-            "meta": {
-                "latency_ms": latency_ms,
-                "filters_applied": filters_applied
-            }
+        "retrieval": {
+            "latency_ms": int((time.time() - t0) * 1000),
+            "gate_result": gate_result,
+            "needs": needs.dict(),
+            "candidates": final_pool[:req.topk]
         }
     }

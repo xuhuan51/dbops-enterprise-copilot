@@ -1,26 +1,29 @@
-# app/core/config.py
 import os
-from dataclasses import dataclass
 from dotenv import load_dotenv
 
-# 尽量从项目根目录加载 .env
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+# 加载 .env
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(project_root, ".env"))
 
-@dataclass(frozen=True)
+
 class Settings:
-    MYSQL_HOST: str = os.getenv("MYSQL_HOST", "127.0.0.1")
-    MYSQL_PORT: int = int(os.getenv("MYSQL_PORT", "3306"))
-    MYSQL_USER: str = os.getenv("MYSQL_USER", "root")
-    MYSQL_PASSWORD: str = os.getenv("MYSQL_PASSWORD", "")
-    MYSQL_CONNECT_DB: str = os.getenv("MYSQL_CONNECT_DB", "mysql")
+    # MySQL 配置
+    MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+    MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
+    MYSQL_USER = os.getenv("MYSQL_USER", "root")
+    MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+    MYSQL_DB = os.getenv("MYSQL_CONNECT_DB", "mysql")
 
-    # 执行安全参数
-    SQL_DEFAULT_LIMIT: int = int(os.getenv("SQL_DEFAULT_LIMIT", "200"))
-    SQL_MAX_LIMIT: int = int(os.getenv("SQL_MAX_LIMIT", "1000"))
-    SQL_TIMEOUT_MS: int = int(os.getenv("SQL_TIMEOUT_MS", "5000"))  # 5s
+    # 目标抓取库
+    TARGET_DBS = os.getenv("TARGET_DBS", "").split(",")
 
-    # 结果返回控制
-    RESULT_MAX_ROWS: int = int(os.getenv("RESULT_MAX_ROWS", "200"))
+    # LLM 配置
+    LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    LLM_MODEL = os.getenv("LLM_MODEL_NAME", "qwen2.5:14b")
+
+    # 输出路径
+    OUT_PATH = os.path.join(project_root, "data", "schema_catalog.jsonl")
+
 
 settings = Settings()
