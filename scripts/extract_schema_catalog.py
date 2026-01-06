@@ -1,444 +1,171 @@
 import os
+import sys
 import json
-import re
-from datetime import datetime, date
-from decimal import Decimal
-
-import pymysql
-from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from openai import OpenAI
+from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
+from sentence_transformers import SentenceTransformer
 
-from app.core.prompts import SCHEMA_ENRICH_PROMPT
-
-# ===========================
-# 0. 配置加载
-# ===========================
+# 1. 环境配置
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 load_dotenv(os.path.join(project_root, ".env"))
 
-OUT_PATH = os.path.join(project_root, "data", "schema_catalog_enriched.jsonl")
-SAMPLE_N = int(os.getenv("SAMPLE_N", "5"))
-ALWAYS_LLM = os.getenv("ALWAYS_LLM", "false").lower() == "true"
-TARGET_DBS = [x.strip() for x in os.getenv("TARGET_DBS", "").split(",") if x.strip()]
+# 2. Milvus 配置
+MILVUS_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "schema_catalog_v2")
 
-# LLM 配置 (兼容 Ollama/vLLM)
-LLM_API_KEY = os.getenv("LLM_API_KEY", "EMPTY")
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip()
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:14b")
-ENABLE_LLM = os.getenv("ENABLE_LLM", "true").lower() == "true" and bool(LLM_BASE_URL)
+# 🔥 变更点 1: 输入文件路径改为 V2 产物
+SOURCE_FILE = os.path.join(project_root, "data", "table_card_v1.jsonl")
 
-client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL) if ENABLE_LLM else None
-
-# ===========================
-# 1. 基础工具函数
-# ===========================
-
-def get_conn(db_name: Optional[str] = None):
-    return pymysql.connect(
-        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-        port=int(os.getenv("MYSQL_PORT", "3306")),
-        user=os.getenv("MYSQL_USER", "root"),
-        password=os.getenv("MYSQL_PASSWORD", ""),
-        database=db_name,
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-    )
-
-import re
-
-def get_logical_name(table_name: str) -> str:
-    # 1) 按周：log_xxx_2025w074 / log_xxx_2025W074
-    m = re.match(r"^(.*)_(\d{4})[wW](\d{2,3})$", table_name)
-    if m:
-        return f"{m.group(1)}_*"
-
-    # 2) 按日期/年月：t_log_20240101 / t_log_202310
-    m = re.match(r"^(.*)_(\d{6,8})$", table_name)
-    if m:
-        return f"{m.group(1)}_*"
-
-    # 3) 按数字分片：t_order_001 / t_order_0007
-    m = re.match(r"^(.*)_(\d{2,6})$", table_name)
-    if m:
-        return f"{m.group(1)}_*"
-
-    return table_name
+EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+BATCH_SIZE = int(os.getenv("MILVUS_BATCH_SIZE", "64"))  # BGE-M3 比较大，Batch 调小点稳妥
+TEXT_MAX_LEN = int(os.getenv("MILVUS_TEXT_MAX_LEN", "8000"))
 
 
-def _safe_str(val: Any) -> str:
-    try:
-        return "" if val is None else str(val)
-    except Exception:
-        return ""
+def init_milvus(dim: int) -> Collection:
+    print(f"🔌 Connecting to Milvus {MILVUS_HOST}:{MILVUS_PORT}...")
+    connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
 
-def mask_sensitive_data(val: Any) -> Any:
-    if val is None:
-        return None
-    s = str(val)
+    if utility.has_collection(COLLECTION_NAME):
+        print(f"🗑️ Dropping existing collection: {COLLECTION_NAME}")
+        utility.drop_collection(COLLECTION_NAME)
 
-    if re.fullmatch(r"1\d{10}", s):
-        return s[:3] + "****" + s[-4:]
-    if re.fullmatch(r"\d{15}|\d{17}[\dXx]", s):
-        return s[:4] + "**********" + s[-4:]
-    if "@" in s and "." in s:
-        name, domain = s.split("@", 1)
-        return (name[:2] + "***@" + domain) if len(name) > 2 else ("***@" + domain)
-    if len(s) > 80:
-        return s[:80] + "..."
+    print(f"🔨 Creating collection: {COLLECTION_NAME}")
 
-    # ✅ 关键兜底：确保可 JSON 序列化
-    if isinstance(val, (datetime, date, Decimal)):
-        return str(val)
+    # 🔥 变更点 2: Schema 适配 TableCard 结构
+    fields = [
+        # 主键
+        FieldSchema(name="full_name", dtype=DataType.VARCHAR, max_length=256, is_primary=True),
+        # 向量
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
 
-    return val
+        # 基础元数据 (来自 identity)
+        FieldSchema(name="db", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="logical_table", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="domain", dtype=DataType.VARCHAR, max_length=64),
 
+        # 治理元数据 (来自 llm) -> 用于过滤
+        FieldSchema(name="risk_level", dtype=DataType.VARCHAR, max_length=32),  # normal/sensitive
+        FieldSchema(name="table_type", dtype=DataType.VARCHAR, max_length=32),  # fact/dim
 
-def stable_unique(seq: List[str]) -> List[str]:
-    """保持顺序去重"""
-    seen = set()
-    out = []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+        # 核心特征 (来自 features) -> 存为 JSON 字符串，Gate 取出来转 dict 用
+        # 这样比存 feat_join_keys, feat_time_cols 多个字段更灵活，以后加特征不用改表结构
+        FieldSchema(name="features_json", dtype=DataType.VARCHAR, max_length=4096),
 
-def extract_json_object(text: str) -> Optional[dict]:
-    """从文本中粗暴抽 JSON 对象兜底（用于 openai-compatible 不支持 response_format 的情况）"""
-    if not text:
-        return None
-    # 找到第一个 { 到最后一个 }
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    chunk = text[start:end + 1]
-    try:
-        return json.loads(chunk)
-    except Exception:
-        return None
+        # 文本内容 (来自 text)
+        FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=max(8192, TEXT_MAX_LEN + 256)),
+    ]
 
-# ===========================
-# 2. 规则抽取
-# ===========================
+    schema = CollectionSchema(fields, description="TableCard V2: Governance Asset Catalog")
+    col = Collection(COLLECTION_NAME, schema)
 
-TIME_NAME_HINTS = ("time", "date", "dt", "ts", "created", "updated", "create", "update")
-METRIC_NAME_HINTS = ("amount", "amt", "price", "fee", "cost", "qty", "quantity", "count", "num", "score", "latency", "duration", "rt", "total")
-JOIN_NAME_HINTS = ("_id", "uid", "oid", "sku", "order", "user", "member", "customer", "supplier", "vendor", "code", "no", "uuid")
-
-def infer_capabilities_by_rule(columns: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """规则推断 time/metric/join_keys（domain 单独推断）"""
-    caps = {
-        "time_cols": [],
-        "metric_cols": [],
-        "join_keys": [],
+    # 索引
+    index_params = {
+        "index_type": "HNSW",
+        "metric_type": "IP",  # 内积 (适用于归一化后的 Cosine 相似度)
+        "params": {"M": 16, "efConstruction": 200},
     }
+    col.create_index(field_name="embedding", index_params=index_params)
+    return col
 
-    for col in columns:
-        name = _safe_str(col.get("name")).lower()
-        ctype = _safe_str(col.get("type")).lower()
 
-        # Time: 类型优先；其次名字提示 + (int/char 也允许 timestamp 字符串)
-        if any(t in ctype for t in ("datetime", "timestamp", "date")):
-            caps["time_cols"].append(col["name"])
-        elif any(k in name for k in TIME_NAME_HINTS):
-            caps["time_cols"].append(col["name"])
+def insert_batch(col: Collection, model: SentenceTransformer, batch: list[dict]):
+    texts = [x["raw_text_for_emb"] for x in batch]
+    # 归一化向量，使得 IP 等价于 Cosine
+    embeddings = model.encode(texts, normalize_embeddings=True)
 
-        # Metric: 数值 + 名字提示，且不是 *_id
-        is_num = any(x in ctype for x in ("int", "decimal", "float", "double"))
-        if is_num and any(k in name for k in METRIC_NAME_HINTS) and not name.endswith("_id"):
-            caps["metric_cols"].append(col["name"])
+    col.insert([
+        [x["full_name"] for x in batch],
+        embeddings.tolist(),
+        [x["db"] for x in batch],
+        [x["logical_table"] for x in batch],
+        [x["domain"] for x in batch],
+        [x["risk_level"] for x in batch],
+        [x["table_type"] for x in batch],
+        [x["features_json"] for x in batch],
+        [x["text"] for x in batch],
+    ])
 
-        # Join keys: *_id 或 常见实体键
-        if name in ("id", "uuid") or name.endswith("_id") or any(k in name for k in JOIN_NAME_HINTS):
-            caps["join_keys"].append(col["name"])
-
-    caps["time_cols"] = stable_unique(caps["time_cols"])
-    caps["metric_cols"] = stable_unique(caps["metric_cols"])
-    caps["join_keys"] = stable_unique(caps["join_keys"])
-    return caps
-
-def infer_domain_by_name(db: str, table: str) -> str:
-    s = f"{db}.{table}".lower()
-    if any(x in s for x in ("trade", "order", "pay", "bill", "refund", "settle")):
-        return "trade"
-    if any(x in s for x in ("user", "member", "customer", "account", "login", "profile")):
-        return "user"
-    if any(x in s for x in ("scm", "stock", "sku", "supplier", "purchase", "warehouse", "wh")):
-        return "scm"
-    if any(x in s for x in ("mkt", "act", "coupon", "promo", "campaign", "live")):
-        return "marketing"
-    if any(x in s for x in ("log", "record", "trace", "err", "audit", "metric")):
-        return "log"
-    return "other"
-
-# ===========================
-# 3. LLM 增强
-# ===========================
-
-COLUMN_NAME_NOSENSE_RE = re.compile(r"^(c|col|f|field)_?\d+$", re.IGNORECASE)
-
-def should_call_llm(table_comment: str, columns: List[Dict[str, Any]]) -> bool:
-    """
-    触发 LLM 的条件（更靠谱）：
-    - ALWAYS_LLM
-    - 表注释为空，且列注释空比例高
-    - 无语义列名比例高（c1/col1/f_01/field3...）
-    """
-    if ALWAYS_LLM:
-        return True
-
-    if not ENABLE_LLM:
-        return False
-
-    col_comments = [_safe_str(c.get("comment")) for c in columns]
-    empty_comment_ratio = 0.0
-    if columns:
-        empty_comment_ratio = sum(1 for x in col_comments if not x.strip()) / len(columns)
-
-    nosense_ratio = 0.0
-    if columns:
-        nosense_ratio = sum(1 for c in columns if COLUMN_NAME_NOSENSE_RE.match(_safe_str(c.get("name")))) / len(columns)
-
-    # 经验阈值
-    if (not (table_comment or "").strip() and empty_comment_ratio >= 0.6) or nosense_ratio >= 0.3:
-        return True
-
-    return False
-
-def llm_enrich_table(table_info: Dict[str, Any], samples: List[Dict[str, Any]], columns: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """调用 LLM 生成 Table Card 元信息（带幻觉校验）"""
-    if not ENABLE_LLM or client is None:
-        return {}
-
-    valid_cols = set([c["name"] for c in columns])
-
-    cols_for_prompt = [f"{c['name']}({c['type']})" for c in columns[:120]]  # 防止超长
-    prompt = SCHEMA_ENRICH_PROMPT
-
-    try:
-        # 兼容：部分 OpenAI-compatible 不支持 response_format
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-        )
-        content = resp.choices[0].message.content or ""
-        data = None
-        try:
-            data = json.loads(content)
-        except Exception:
-            data = extract_json_object(content)
-
-        if not isinstance(data, dict):
-            return {}
-
-        # 🛡️ 幻觉校验（列名必须存在）
-        data["join_keys"] = [c for c in data.get("join_keys", []) if c in valid_cols]
-        data["time_cols"] = [c for c in data.get("time_cols", []) if c in valid_cols]
-        data["metric_cols"] = [c for c in data.get("metric_cols", []) if c in valid_cols]
-
-        # 合法值兜底
-        if data.get("domain") not in ("trade", "user", "scm", "marketing", "log", "other"):
-            data["domain"] = "other"
-        if data.get("risk") not in ("sensitive", "none"):
-            data["risk"] = "none"
-
-        # 截断 synonyms 防爆
-        syn = data.get("synonyms", [])
-        if isinstance(syn, list):
-            data["synonyms"] = [str(x)[:80] for x in syn[:30]]
-        else:
-            data["synonyms"] = []
-
-        if "summary" in data and isinstance(data["summary"], str):
-            data["summary"] = data["summary"][:200]
-
-        return data
-
-    except Exception as e:
-        print(f"    ⚠️ LLM Enrich Failed: {type(e).__name__}: {e}")
-        return {}
-
-# ===========================
-# 4. 主流程
-# ===========================
 
 def main():
-    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-    processed_logical_tables = set()
+    if not os.path.exists(SOURCE_FILE):
+        print(f"❌ File not found: {SOURCE_FILE}. Please run extract_schema_catalog_v2.py first.")
+        return
 
-    with open(OUT_PATH, "w", encoding="utf-8") as f_out:
-        for db in TARGET_DBS:
-            print(f"📦 Scanning DB: {db} ...")
+    print(f"🧠 Loading embedding model: {EMBED_MODEL}...")
+    try:
+        model = SentenceTransformer(EMBED_MODEL)
+    except Exception as e:
+        print(f"❌ Model load failed: {e}")
+        print("Try: pip install sentence-transformers")
+        return
+
+    # 测算维度
+    test_emb = model.encode(["test"], normalize_embeddings=True)
+    dim = int(test_emb.shape[1])
+    print(f"📏 Vector dimension: {dim}")
+
+    col = init_milvus(dim)
+
+    inserted = 0
+    batch = []
+
+    print(f"🚀 Processing data from {SOURCE_FILE}...")
+    with open(SOURCE_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+
             try:
-                conn = get_conn(db)
-                cur = conn.cursor()
+                card = json.loads(line)
+            except:
+                continue
 
-                # 只扫 BASE TABLE
-                cur.execute("""
-                    SELECT table_name, table_comment
-                    FROM information_schema.tables
-                    WHERE table_schema=%s AND table_type='BASE TABLE'
-                    ORDER BY table_name
-                """, (db,))
-                tables = cur.fetchall()
+            # 🔥 变更点 3: 解析嵌套结构 (TableCard)
+            ident = card.get("identity", {})
+            llm = card.get("llm", {})
+            features = card.get("features", {})
 
-                for t_row in tables:
-                    table = t_row.get("table_name") or t_row.get("TABLE_NAME")
-                    t_comment = t_row.get("table_comment") or t_row.get("TABLE_COMMENT") or ""
+            # 构造主键
+            full_name = f"{ident.get('db')}.{ident.get('logical_table')}"
 
-                    logical_table = get_logical_name(table)
-                    full_logical_key = f"{db}.{logical_table}"
+            # 截断文本防止超长
+            raw_text = card.get("text", "")
+            safe_text = raw_text[:TEXT_MAX_LEN]
 
-                    # 分片去重：只处理一个代表分片
-                    if full_logical_key in processed_logical_tables:
-                        continue
-                    processed_logical_tables.add(full_logical_key)
+            entry = {
+                "full_name": full_name,
+                "db": ident.get("db", ""),
+                "logical_table": ident.get("logical_table", ""),
+                "domain": ident.get("domain", "unknown"),
 
-                    print(f"  👉 Processing: {table} -> {logical_table}")
+                # 新字段
+                "risk_level": llm.get("risk_level", "normal"),
+                "table_type": llm.get("table_type", "unknown"),
+                "features_json": json.dumps(features, ensure_ascii=False),  # 存整个特征包
 
-                    # 1) Columns（按顺序）
-                    cur.execute("""
-                        SELECT COLUMN_NAME, DATA_TYPE, COLUMN_COMMENT, COLUMN_KEY
-                        FROM information_schema.columns
-                        WHERE table_schema=%s AND table_name=%s
-                        ORDER BY ORDINAL_POSITION
-                    """, (db, table))
-                    raw_cols = cur.fetchall()
+                "text": safe_text,
+                "raw_text_for_emb": raw_text  # 向量计算用全量
+            }
+            batch.append(entry)
 
-                    columns = []
-                    pk = []
-                    for rc in raw_cols:
-                        col_obj = {
-                            "name": rc["COLUMN_NAME"],
-                            "type": rc["DATA_TYPE"],
-                            "comment": rc.get("COLUMN_COMMENT") or "",
-                            "key": rc.get("COLUMN_KEY") or ""
-                        }
-                        columns.append(col_obj)
-                        if (rc.get("COLUMN_KEY") or "") == "PRI":
-                            pk.append(rc["COLUMN_NAME"])
+            if len(batch) >= BATCH_SIZE:
+                insert_batch(col, model, batch)
+                inserted += len(batch)
+                print(f"  ✅ Inserted: {inserted}")
+                batch = []
 
-                    # 2) Indexes（保序）
-                    cur.execute("""
-                        SELECT INDEX_NAME, COLUMN_NAME
-                        FROM information_schema.statistics
-                        WHERE table_schema=%s AND table_name=%s
-                        ORDER BY INDEX_NAME, SEQ_IN_INDEX
-                    """, (db, table))
-                    idx_rows = cur.fetchall()
-                    indexes: Dict[str, List[str]] = {}
-                    for ir in idx_rows:
-                        idx = ir["INDEX_NAME"]
-                        indexes.setdefault(idx, []).append(ir["COLUMN_NAME"])
+    if batch:
+        insert_batch(col, model, batch)
+        inserted += len(batch)
+        print(f"  ✅ Inserted: {inserted}")
 
-                    # 3) Rule features + domain
-                    rule_caps = infer_capabilities_by_rule(columns)
-                    rule_domain = infer_domain_by_name(db, table)
+    col.flush()
+    # col.load() # 写入完不需要立即 load，等查询时再 load
 
-                    # 4) Sampling（优先关键列，稳定去重）
-                    priority_cols = stable_unique(rule_caps["time_cols"] + rule_caps["metric_cols"] + rule_caps["join_keys"])
-                    if priority_cols:
-                        select_cols = priority_cols[:12]
-                    else:
-                        select_cols = [c["name"] for c in columns[:10]]
+    print(f"🎉 All Done! Total {col.num_entities} entities indexed in '{COLLECTION_NAME}'.")
 
-                    samples: List[Dict[str, Any]] = []
-                    if select_cols:
-                        try:
-                            col_str = ",".join([f"`{c}`" for c in select_cols])
-                            cur.execute(f"SELECT {col_str} FROM `{table}` LIMIT {SAMPLE_N}")
-                            rows = cur.fetchall()
-                            for r in rows:
-                                samples.append({k: mask_sensitive_data(v) for k, v in r.items()})
-                        except Exception as e:
-                            print(f"    ⚠️ Sampling failed: {type(e).__name__}: {e}")
-
-                    # 5) LLM enrich（按条件触发）
-                    llm_result: Dict[str, Any] = {}
-                    if should_call_llm(t_comment, columns):
-                        print("    🧠 Calling LLM for enrichment...")
-                        llm_result = llm_enrich_table(
-                            {"db": db, "table": table, "comment": t_comment},
-                            samples,
-                            columns
-                        )
-
-                    # 6) Merge features（LLM 追加/增强）
-                    final_features = {
-                        "join_keys": stable_unique(rule_caps["join_keys"] + llm_result.get("join_keys", [])),
-                        "time_cols": stable_unique(rule_caps["time_cols"] + llm_result.get("time_cols", [])),
-                        "metric_cols": stable_unique(rule_caps["metric_cols"] + llm_result.get("metric_cols", [])),
-                    }
-                    final_domain = llm_result.get("domain") or rule_domain
-                    final_summary = llm_result.get("summary") or (t_comment.strip() if t_comment.strip() else f"{logical_table}（未命名表）")
-                    synonyms = llm_result.get("synonyms", [])
-                    if not isinstance(synonyms, list):
-                        synonyms = []
-
-                    # 7) TableCard Text（embedding 用）
-                    col_desc_list = []
-                    for c in columns[:80]:
-                        role = []
-                        if c["name"] in final_features["join_keys"]:
-                            role.append("JOIN")
-                        if c["name"] in final_features["time_cols"]:
-                            role.append("TIME")
-                        if c["name"] in final_features["metric_cols"]:
-                            role.append("METRIC")
-                        role_str = f"[{','.join(role)}]" if role else ""
-                        comment = (c.get("comment") or "").strip()
-                        if comment:
-                            col_desc_list.append(f"- {c['name']} ({c['type']}) {comment} {role_str}".strip())
-                        else:
-                            col_desc_list.append(f"- {c['name']} ({c['type']}) {role_str}".strip())
-
-                    samples_preview = samples[:2]  # 控制长度
-                    text_block = "\n".join([
-                        "[TableCard]",
-                        f"DB: {db}",
-                        f"Table: {logical_table} (Physical: {table})",
-                        f"Domain: {final_domain}",
-                        f"Summary: {final_summary}",
-                        f"Synonyms: {', '.join([str(x) for x in synonyms[:20]])}",
-                        "Capabilities:",
-                        f"- Time: {final_features['time_cols']}",
-                        f"- Metrics: {final_features['metric_cols']}",
-                        f"- Joins: {final_features['join_keys']}",
-                        "Columns:",
-                        *col_desc_list[:40],
-                        "Samples:",
-                        json.dumps(samples_preview, ensure_ascii=False, default=str),
-                    ]).strip()
-
-                    record = {
-                        "db": db,
-                        "table": table,                 # 物理表名
-                        "logical_table": logical_table, # 逻辑表名
-                        "domain": final_domain,
-                        "table_comment": t_comment,
-                        "columns": columns,
-                        "pk": pk,
-                        "indexes": indexes,
-                        "samples": samples,
-                        "features": final_features,
-                        "llm": llm_result,
-                        "text": text_block,
-                    }
-                    f_out.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-
-                    f_out.flush()
-
-                cur.close()
-                conn.close()
-
-            except Exception as e:
-                print(f"❌ Error processing DB {db}: {type(e).__name__}: {e}")
-
-    print(f"\n✅ Extraction Done! Output: {OUT_PATH}")
 
 if __name__ == "__main__":
     main()
