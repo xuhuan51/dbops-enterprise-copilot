@@ -34,6 +34,7 @@ class SQLOutput(BaseModel):
 
 
 class ErrorOutput(BaseModel):
-    error_type: Literal["MISSING_COLUMN", "MISSING_TABLE", "WRONG_TABLE", "NON_FIXABLE"]
+    # 🔥 1. 增加 "SYNTAX_ERROR" 选项
+    error_type: Literal["MISSING_COLUMN", "MISSING_TABLE", "WRONG_TABLE", "SYNTAX_ERROR", "NON_FIXABLE"]
     analysis: str
-    search_keywords: List[str] = Field(description="用于补搜的关键词列表")
+    search_keywords: List[str] = Field(description="用于补搜的关键词")

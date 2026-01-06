@@ -1,283 +1,128 @@
+import os
 import json
-import re
-import time
-import uuid
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
+from pymilvus import Collection, connections
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
-from fastapi import APIRouter
-from pydantic import BaseModel, Field
+# 1. 配置
+MILVUS_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "schema_catalog_v2")
 
-# 引入核心组件
-from app.core.llm import chat_completion
-from app.core.prompts import RETRIEVAL_JUDGE_TEMPLATE
-from app.core.domain_config import get_relevant_rules, ECOMMERCE_EXAMPLES
-from app.modules.retrieval.schema_retriever import retrieve_tables
+# 模型路径
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
+RERANK_MODEL_NAME = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
-router = APIRouter(prefix="/api/v1", tags=["retrieve"])
-
-# =========================
-# 0. 配置参数
-# =========================
-PREFETCH_K = 500  # 向量检索召回数量
-GATE_CANDIDATE_K = 20  # 进入门禁检查的候选表数量
-FINAL_TOP_K = 5  # 最终返回数量
-
-MIN_SCORE_THRESHOLD = 0.45
-MAX_HOPS = 1  # 最大重试次数
+# 单例模式加载模型 (防止每次请求都加载)
+_embed_model = None
+_rerank_model = None
 
 
-# =========================
-# 1. 核心数据结构 (Pydantic)
-# =========================
-
-class Filters(BaseModel):
-    allowed_dbs: Optional[List[str]] = None
-    domain: Optional[str] = None
-
-
-class RetrieveReq(BaseModel):
-    user_id: str
-    query: str
-    topk: int = FINAL_TOP_K
-    filters: Optional[Filters] = None
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        print(f"🧠 Loading Embedding Model: {EMBED_MODEL_NAME}...")
+        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    return _embed_model
 
 
-# ✅ 新增：LLM 提取的需求结构
-class QueryNeeds(BaseModel):
-    intent: str = Field(..., description="data_query | non_data | sensitive")
-    must_have: Dict[str, List[str]] = Field(...,
-                                            description="必须具备的能力，如 {'entity': ['user'], 'dimension': ['time']}")
-    search_keywords: List[str] = Field(default=[], description="用于重搜的关键词")
+def get_rerank_model():
+    global _rerank_model
+    if _rerank_model is None:
+        # CrossEncoder 比较大，如果是 CPU 部署要注意内存
+        print(f"🧠 Loading Rerank Model: {RERANK_MODEL_NAME}...")
+        try:
+            _rerank_model = CrossEncoder(RERANK_MODEL_NAME)
+        except Exception as e:
+            print(f"⚠️ Rerank model load failed: {e}. Fallback to None.")
+    return _rerank_model
 
 
-# =========================
-# 2. 核心组件：Needs Extraction (需求提取)
-# =========================
-def extract_query_needs(query: str) -> QueryNeeds:
+# 建立 Milvus 连接
+try:
+    connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+except Exception as e:
+    print(f"❌ Milvus Connect Error: {e}")
+
+
+# ==========================================
+# 核心检索函数 (Recall + Rerank)
+# ==========================================
+
+def retrieve_tables(query: str, topk: int = 5) -> List[Dict[str, Any]]:
     """
-    让 LLM 分析用户Query，提取硬性需求 (Must Have)。
-    不涉及具体表名，只涉及业务能力。
+    为了兼容旧代码的简单的入口
     """
-    prompt = f"""
-你是一个数据分析师。请分析用户问题，提取查询所需的【核心数据能力】。
+    return retrieve_tables_advanced(query, top_k_recall=topk * 10, top_k_final=topk)
 
-User Query: "{query}"
 
-请输出 JSON，包含：
-1. intent: "data_query" (正常查询) | "non_data" (闲聊/写诗) | "sensitive" (查工资/密码)
-2. must_have: 必须具备的字段能力，从以下类别中选：
-   - "entity": 需要的主体 (user, order, sku, supplier, activity...)
-   - "dimension": 需要的过滤/分组维度 (time, region, channel, status...)
-   - "metric": 需要的统计指标 (amount, qty, count, duration...)
-   - "join": 需要跨表关联 (join)
-3. search_keywords: 如果当前检索失败，你建议用什么关键词去重搜？(提供3-5个同义词/业务词)
+def retrieve_tables_advanced(query: str, top_k_recall: int = 100, top_k_final: int = 5) -> List[Dict[str, Any]]:
+    """
+    企业级检索流程：
+    1. Milvus 向量召回 Top-100 (Recall)
+    2. BGE Cross-Encoder 重排 (Rerank)
+    3. 返回 Top-N (Final)
+    """
+    if not query: return []
 
-示例：
-Query: "统计上个月北京用户的注册量"
-JSON:
-{{
-    "intent": "data_query",
-    "must_have": {{
-        "entity": ["user"],
-        "dimension": ["time", "region"],
-        "metric": ["count"]
-    }},
-    "search_keywords": ["用户基础信息", "注册时间", "create_time", "地区"]
-}}
-"""
+    # --- 1. Recall (Milvus) ---
     try:
-        raw = chat_completion(prompt)
-        # 简单的 JSON 提取
-        json_str = re.search(r"\{[\s\S]*\}", raw).group(0)
-        data = json.loads(json_str)
-        return QueryNeeds(**data)
+        col = Collection(COLLECTION_NAME)
+        col.load()  # 确保加载到内存
+
+        model = get_embed_model()
+        query_vec = model.encode([query], normalize_embeddings=True)[0].tolist()
+
+        # 只取 Agent 需要的字段
+        search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
+        res = col.search(
+            data=[query_vec],
+            anns_field="embedding",
+            param=search_params,
+            limit=top_k_recall,  # 广撒网
+            output_fields=["db", "logical_table", "text"]
+        )
+
+        # 结果转 list
+        candidates = []
+        seen = set()
+
+        for hits in res:
+            for hit in hits:
+                entity = hit.entity
+                # 逻辑表去重 (可能因为分片表导致重复)
+                full_name = f"{entity.get('db')}.{entity.get('logical_table')}"
+                if full_name in seen: continue
+                seen.add(full_name)
+
+                candidates.append({
+                    "score": hit.score,  # 向量相似度
+                    "db": entity.get("db"),
+                    "logical_table": entity.get("logical_table"),
+                    "full_name": full_name,
+                    "text": entity.get("text")
+                })
+
     except Exception as e:
-        print(f"⚠️ Needs Extraction Failed: {e}")
-        # 兜底：假设是普通查询，无强制约束
-        return QueryNeeds(intent="data_query", must_have={}, search_keywords=[])
-
-
-# =========================
-# 3. 核心组件：Capability Gate (硬门禁)
-# =========================
-def check_capabilities(needs: QueryNeeds, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    代码逻辑门禁：检查候选表是否覆盖了 must_have 的能力。
-    返回: {"pass": bool, "missing": str}
-    """
-    # 1. 熔断检查
-    if needs.intent in ["non_data", "sensitive"]:
-        return {"pass": False, "action": "ASK_USER", "reason": f"Intent is {needs.intent}"}
-
-    if not candidates:
-        return {"pass": False, "action": "REWRITE", "reason": "No candidates found"}
-
-    # 2. 收集所有候选表的能力并集
-    # 这里的 features 是从 Milvus 读出来的 feat_xxx_cols JSON 字符串解析后的列表
-    all_caps = {
-        "entity": set(),  # 从 domain 推断，或 features 里有 uid/oid
-        "dimension": set(),
-        "metric": set()
-    }
-
-    for c in candidates:
-        # 解析 features (假设已转为 dict/list)
-        feats = c.get("features", {})
-
-        # Time Dimension
-        if feats.get("time_cols"):
-            all_caps["dimension"].add("time")
-
-        # Region/Status 等其他维度 (可以从 columns 里简单的正则判断，或离线已打标)
-        # 这里简化：如果有 domain=user，默认有 user entity
-        domain = c.get("domain", "")
-        if domain == "user": all_caps["entity"].add("user")
-        if domain == "trade": all_caps["entity"].add("order")
-        if domain == "scm": all_caps["entity"].add("sku")
-
-        # Metrics
-        if feats.get("metric_cols"):
-            all_caps["metric"].add("metric")  # 只要有指标列就算有 metric 能力
-            # 也可以更细：if "amount" in feats['metric_cols']: ...
-
-    # 3. 对照检查
-    missing = []
-
-    # 检查维度 (Time)
-    if "time" in needs.must_have.get("dimension", []) and "time" not in all_caps["dimension"]:
-        missing.append("缺少[时间]维度字段")
-
-    # 检查实体 (User) - 这是一个强校验示例
-    if "user" in needs.must_have.get("entity", []) and "user" not in all_caps["entity"]:
-        missing.append("缺少[用户]相关表")
-
-    # 4. 判定
-    if missing:
-        return {
-            "pass": False,
-            "action": "REWRITE",
-            "reason": f"Gate拦截: {','.join(missing)}",
-            "missing_caps": missing
-        }
-
-    return {"pass": True, "action": "PASS"}
-
-
-# =========================
-# 4. 辅助函数 (聚合 & 搜索)
-# =========================
-def _safe_json_load(s):
-    if isinstance(s, list): return s
-    try:
-        return json.loads(s)
-    except:
+        print(f"❌ Milvus Search Failed: {e}")
         return []
 
+    # --- 2. Rerank (Cross-Encoder) ---
+    reranker = get_rerank_model()
+    if reranker and candidates:
+        # 构造 Pair: [[query, doc1], [query, doc2]...]
+        pairs = [[query, c["text"]] for c in candidates]
+        scores = reranker.predict(pairs)
 
-def aggregate_shards_and_parse(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    1. 分表聚合 (逻辑同前)
-    2. 解析 Milvus 存的 JSON 字符串 (feat_time_cols) 为列表
-    """
-    # ... (分表聚合逻辑与之前相同，略微简化展示) ...
-    # 假设 items 已经是 retrieve_tables 返回的 raw data
+        # 把重排分数写回去
+        for i, c in enumerate(candidates):
+            c["rerank_score"] = float(scores[i])
 
-    # 这里重点是解析 features
-    for it in items:
-        # Milvus 里的 feat_time_cols 是字符串，转回 list
-        it["features"] = {
-            "time_cols": _safe_json_load(it.get("feat_time_cols", "[]")),
-            "metric_cols": _safe_json_load(it.get("feat_metric_cols", "[]")),
-            "join_keys": _safe_json_load(it.get("feat_join_keys", "[]"))
-        }
-    return items  # 这里应保留 aggregate_shards 的去重逻辑
+        # 按重排分数排序
+        candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+    else:
+        # 降级：如果没有重排模型，就按向量分数排
+        candidates.sort(key=lambda x: x["score"], reverse=True)
 
-
-def search_by_keywords(keywords: List[str]) -> List[Dict[str, Any]]:
-    # 调用底层的 retrieve_tables
-    # 实际应包含去重逻辑
-    results = []
-    for kw in keywords:
-        res = retrieve_tables(kw, topk=50)  # 扩大搜索
-        if res: results.extend(res)
-    return aggregate_shards_and_parse(results)
-
-
-# =========================
-# 5. 原有的 Judge (用于 Gate 通过后的精选)
-# =========================
-def llm_judge_final(query: str, candidates: List[Dict[str, Any]]) -> Dict:
-    # ... (代码与之前一致：动态 prompt + 规则) ...
-    # 略写，直接调用之前的逻辑
-    return {"status": "PASS", "selected_tables": [c['logical_table'] for c in candidates[:3]]}
-
-
-# =========================
-# 6. 主 API 入口
-# =========================
-@router.post("/retrieve_tables_gate")
-def retrieve_tables_with_gate(req: RetrieveReq):
-    trace_id = str(uuid.uuid4())
-    t0 = time.time()
-
-    # --- Step 1: 初始检索 (Vector Recall) ---
-    raw_1 = retrieve_tables(req.query, topk=PREFETCH_K) or []
-    # 聚合分表 & 解析 features JSON
-    candidates_pool = aggregate_shards_and_parse(raw_1)
-
-    # 截取 Top K 进入门禁
-    candidates_gate = candidates_pool[:GATE_CANDIDATE_K]
-
-    # --- Step 2: 需求提取 (LLM) ---
-    needs = extract_query_needs(req.query)
-
-    # --- Step 3: Capability Gate (Python Logic) ---
-    gate_result = check_capabilities(needs, candidates_gate)
-
-    gate_action = gate_result["action"]
-    final_pool = candidates_gate
-
-    # --- Step 4: 处理 Gate 结果 ---
-    if gate_action == "ASK_USER":
-        return {
-            "success": True,
-            "agent_decision": {"need_clarify": True, "reason": gate_result["reason"]}
-        }
-
-    elif gate_action == "REWRITE":
-        # 🔴 触发重搜！
-        print(f"🔄 Gate blocked: {gate_result['reason']}. Rewriting...")
-
-        # 使用 LLM 生成的 keywords 重搜
-        new_kws = needs.search_keywords
-        if new_kws:
-            raw_2 = search_by_keywords(new_kws)
-            # 合并结果 (去重)
-            seen = {c.get("full_name") for c in candidates_pool}
-            for r in raw_2:
-                if r.get("full_name") not in seen:
-                    candidates_pool.append(r)
-                    seen.add(r.get("full_name"))
-
-            # 重新排序 (简单按原有分数或置顶新结果)
-            final_pool = candidates_pool[:GATE_CANDIDATE_K]  # 再次截取
-        else:
-            # 没生成关键词，无奈 Pass
-            pass
-
-    # --- Step 5: Final Judge (LLM Selection) ---
-    # 现在 final_pool 里应该包含了补搜回来的表
-    # 这里调用之前的 judge 逻辑做最后的清洗
-    # judge_res = llm_judge(req.query, final_pool) ...
-
-    # (为了演示，直接返回 final_pool)
-    return {
-        "trace_id": trace_id,
-        "success": True,
-        "retrieval": {
-            "latency_ms": int((time.time() - t0) * 1000),
-            "gate_result": gate_result,
-            "needs": needs.dict(),
-            "candidates": final_pool[:req.topk]
-        }
-    }
+    # --- 3. Cut Off ---
+    return candidates[:top_k_final]

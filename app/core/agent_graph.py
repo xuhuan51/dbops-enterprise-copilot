@@ -1,4 +1,3 @@
-# app/core/agent_graph_v2.py
 import os
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -142,15 +141,23 @@ def route_after_validate(state: AgentState):
 
 
 def route_after_classify(state: AgentState):
-    # 1. 超过重试次数 (Initial + 1 Repair)
-    if state["retry_count"] >= 1:
-        print("🛑 Max retries reached. Giving up.")
+    # 1. 重试次数熔断
+    if state["retry_count"] >= 1:  # 生产环境建议设为 2
+        print("🛑 Max retries reached.")
         return END
 
-    # 2. 不可修复
-    if state["error_type"] == "NON_FIXABLE":
+    error_type = state["error_type"]
+
+    # 2. 不可修复 -> 结束
+    if error_type == "NON_FIXABLE":
         return END
 
+    # 🔥 3. 新增逻辑：如果是语法错误，直接去生成节点 (Generate) 重写
+    if error_type == "SYNTAX_ERROR":
+        print("🔄 Syntax Error detected. Retrying generation immediately...")
+        return "generate"
+
+    # 4. 其他错误 (缺表/缺列) -> 去补搜 (Repair)
     return "repair"
 
 
@@ -176,7 +183,15 @@ workflow.add_conditional_edges("intent", route_after_intent)
 workflow.add_edge("retrieve", "generate")
 workflow.add_edge("generate", "validate")
 workflow.add_conditional_edges("validate", route_after_validate)
-workflow.add_conditional_edges("classify", route_after_classify)
+workflow.add_conditional_edges(
+    "classify",
+    route_after_classify,
+    {
+        "repair": "repair",
+        "generate": "generate",  # 👈 允许从分类节点直接跳回生成节点
+        END: END
+    }
+)
 workflow.add_edge("repair", "generate")  # 闭环
 
 # Compile

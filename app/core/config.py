@@ -12,7 +12,14 @@ class Settings:
     MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
     MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-    MYSQL_DB = os.getenv("MYSQL_CONNECT_DB", "mysql")
+    MYSQL_CONNECT_DB = os.getenv("MYSQL_CONNECT_DB", "mysql")
+    # SQL 执行超时时间 (毫秒)，默认 10秒
+    # 逻辑：尝试去读环境变量 SQL_TIMEOUT_MS，读不到就用 "10000"，最后转成 int
+    SQL_TIMEOUT_MS = int(os.getenv("SQL_TIMEOUT_MS", "10000"))
+
+    # 结果集最大行数限制，默认 1000行
+    # 逻辑：防止一次查出几万行数据撑爆内存
+    RESULT_MAX_ROWS = int(os.getenv("RESULT_MAX_ROWS", "1000"))
 
     # 目标抓取库
     TARGET_DBS = os.getenv("TARGET_DBS", "").split(",")
