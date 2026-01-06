@@ -116,6 +116,7 @@ GEN_SQL_PROMPT = """
 3. 输出标准 SQL，不要包含 Markdown 格式（```sql ... ```）。
 """
 
+
 ERROR_CLASSIFY_PROMPT = """
 你是一个数据库错误分析师。
 [SQL]: {sql}
@@ -123,30 +124,14 @@ ERROR_CLASSIFY_PROMPT = """
 
 请分析错误类型并提供补救建议：
 
-1. MISSING_COLUMN: 报错 'Unknown column'。说明候选表中缺字段，或者引用了不存在的列。
-   -> 提取该列名（如 'region'）。
-2. MISSING_TABLE: 报错 'Table doesn't exist' 或语义上无法关联。
-   -> 提取缺少的实体名（如 'user_dim'）。
-3. WRONG_TABLE: 语义错误，选错了表。
-4. NON_FIXABLE: 语法严重错误，或无法通过补搜解决。
-
-请提取用于去知识库补搜的关键词 (search_keywords)。
-"""
-
-
-ERROR_CLASSIFY_PROMPT = """
-你是一个数据库错误分析师。
-[SQL]: {sql}
-[Error]: {error_msg}
-
-请分析错误类型：
-
 1. SYNTAX_ERROR: 语法错误（如 Error 1064），或函数使用错误。
-   -> 补救：不需要补搜，直接重写。
-2. MISSING_COLUMN: 报错 'Unknown column'。
-3. MISSING_TABLE: 报错 'Table doesn't exist'。
-4. WRONG_TABLE: 选错表。
-5. NON_FIXABLE: 严重且无法修复的错误。
+   -> 补救：不需要补搜，直接重写。关键词留空。
+2. MISSING_COLUMN: 报错 'Unknown column'。说明候选表中缺字段，或者引用了不存在的列。
+   -> 提取该列名（如 'region'）。
+3. MISSING_TABLE: 报错 'Table doesn't exist' 或语义上无法关联。
+   -> 提取缺少的实体名（如 'user_dim'）。
+4. WRONG_TABLE: 语义错误，选错了表。
+5. NON_FIXABLE: 语法严重错误，或无法通过补搜解决。
 
-请提取补搜关键词（如果是语法错误，关键词留空）。
+请提取用于去知识库补搜的关键词 (search_keywords)。如果是 SYNTAX_ERROR，请输出空列表。
 """

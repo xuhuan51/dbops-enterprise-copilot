@@ -3,17 +3,19 @@ import re
 from openai import OpenAI
 from dotenv import load_dotenv
 
+from app.core.config import settings
+
 load_dotenv()
 
-# 1. 优先读取环境变量
-CURRENT_MODEL = os.getenv("LLM_MODEL_NAME", "qwen2.5:14b")
 
 # 初始化客户端
 client = OpenAI(
-    api_key=os.getenv("LLM_API_KEY", "ollama"),
-    base_url=os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+    api_key=settings.LLM_API_KEY,
+    base_url=settings.LLM_BASE_URL
 )
 
+# 🔥 统一模型变量
+CURRENT_MODEL = settings.LLM_MODEL
 
 def extract_json_from_text(text: str) -> str:
     """
@@ -21,15 +23,10 @@ def extract_json_from_text(text: str) -> str:
     改了个名字，防止和局部变量冲突
     """
     try:
-        # 1. 尝试找到第一个 '{' 和最后一个 '}'
         start = text.find('{')
         end = text.rfind('}')
-
         if start != -1 and end != -1:
-            # 截取中间这一段，这才是真正的 JSON
             return text[start:end + 1]
-
-        # 2. 如果没找到大括号，就把 markdown 符号去掉试试
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"^```\s*", "", text)
         text = re.sub(r"\s*```$", "", text)

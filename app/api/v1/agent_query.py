@@ -1,10 +1,12 @@
-# app/api/v1/agent_query.py
+import json
 import uuid
+import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.core.agent_graph import app as agent_app  # 引用我们的大杀器
+from app.core.agent_graph import app as agent_app
 from app.modules.sql.executor import execute_select
+from app.core.logger import logger  # 🔥 引入统一 Logger
 
 router = APIRouter(tags=["Agent"])
 
@@ -16,24 +18,29 @@ class QueryRequest(BaseModel):
 
 @router.post("/query")
 async def agent_query(req: QueryRequest):
-    """
-    Agentic Text-to-SQL 入口
-    流程: Intent -> Retrieve -> Rerank -> Generate -> Validate -> Repair -> Execution
-    """
+    # 1. 生成全链路唯一 ID
     trace_id = str(uuid.uuid4())
-    print(f"🚀 [API] New Request {trace_id}: {req.query}")
+
+    # 📝 结构化日志
+    logger.info("Request received", extra={
+        "trace_id": trace_id,
+        "event": "request_start",
+        "query": req.query,
+        "user_id": req.user_id
+    })
 
     try:
-        # 1. 调用 LangGraph (同步调用，如果耗时久可改为 invoke_async)
-        # 输入: {"question": ...}
-        # 输出: Final State
-        final_state = agent_app.invoke({"question": req.query})
+        # 🔥 核心修复 1: 改用 ainvoke (异步调用)，防止 LangGraph 内部同步操作阻塞主线程
+        final_state = await agent_app.ainvoke({
+            "question": req.query,
+            "trace_id": trace_id,
+            "retry_count": 0
+        })
 
-        # 2. 检查结果状态
         intent = final_state.get("intent")
 
-        # A. 非数据查询 / 敏感查询
         if intent != "data_query":
+            logger.info("Query blocked or non-data intent", extra={"trace_id": trace_id, "intent": intent})
             return {
                 "trace_id": trace_id,
                 "success": False,
@@ -41,9 +48,9 @@ async def agent_query(req: QueryRequest):
                 "message": "Guardrail blocked or non-data query."
             }
 
-        # B. SQL 生成失败 (重试耗尽或不可修复)
         error = final_state.get("validation_error")
         if error:
+            logger.warning("Agent failed to generate valid SQL", extra={"trace_id": trace_id, "error": error})
             return {
                 "trace_id": trace_id,
                 "success": False,
@@ -51,21 +58,30 @@ async def agent_query(req: QueryRequest):
                 "steps": final_state.get("retry_count", 0)
             }
 
-        # C. 成功生成 SQL -> 执行真实查询
         sql = final_state["generated_sql"]
-        print(f"🔍 [API] Executing SQL: {sql}")
+        logger.info(f"Executing SQL: {sql}", extra={"trace_id": trace_id})
 
-        result_data = execute_select(req.user_id, sql)
+        # 🔥 核心修复 2: 将同步的 SQL 执行扔到线程池
+        # 避免 execute_select (pymysql) 卡死 Event Loop
+        loop = asyncio.get_running_loop()
+        result_data = await loop.run_in_executor(
+            None,
+            lambda: execute_select(req.user_id, sql, trace_id=trace_id)
+        )
 
-        # 把 Agent 的思考过程也返回给前端 (可选)
+        # 构造返回
         result_data["agent_meta"] = {
+            "trace_id": trace_id,
             "confidence": final_state.get("sql_confidence"),
             "retries": final_state.get("retry_count"),
-            "tables_used": [t['logical_table'] for t in final_state.get('candidate_tables', [])]
+            "retrieved_context": [t['logical_table'] for t in final_state.get('candidate_tables', [])],
+            "tables_used": final_state.get("tables_used", []),
+            "assumptions": final_state.get("assumptions", [])
         }
 
+        logger.info("Request finished successfully", extra={"trace_id": trace_id})
         return result_data
 
     except Exception as e:
-        print(f"❌ [API] Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Internal Error", extra={"trace_id": trace_id}, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"[{trace_id}] Internal Error: {str(e)}")

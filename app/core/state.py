@@ -2,30 +2,32 @@ from typing import List, Dict, Any, TypedDict, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-# --- Graph 状态 ---
 class AgentState(TypedDict):
+    # 基础字段
+    trace_id: str
     question: str
-    intent: str  # 意图
-    candidate_tables: List[Dict]  # 候选表池
+    intent: str
 
-    generated_sql: str  # 生成的 SQL
-    sql_confidence: float  # 信心分
+    # 召回层 (Retrieval Context)
+    candidate_tables: List[Dict]
 
-    validation_error: Optional[str]  # 验证报错信息
-    error_type: Optional[str]  # 错误类型
-    repair_keywords: List[str]  # 补搜词
+    # 生成层 (Generation Output)
+    generated_sql: str
+    sql_confidence: float
+    # 🔥 新增字段: 记录模型真实的引用情况
+    tables_used: List[str]  # 模型声称用到的表名
+    assumptions: List[str]  # 模型做的业务假设 (如: "假设 status=1 是有效订单")
 
-    retry_count: int  # 重试计数
-    final_result: Any  # 最终 SQL 或 结果
+    # 错误处理层
+    validation_error: Optional[str]
+    error_type: Optional[str]
+    repair_keywords: List[str]
+
+    retry_count: int
+    final_result: Any
 
 
-# --- LLM 输出结构 (Structured Output) ---
-
-class IntentOutput(BaseModel):
-    intent: Literal["data_query", "sensitive", "non_data"]
-    reason: str
-
-
+# --- LLM 输出结构 (保持不变) ---
 class SQLOutput(BaseModel):
     sql: str = Field(description="生成的 SQL 语句")
     assumptions: List[str] = Field(description="假设条件")

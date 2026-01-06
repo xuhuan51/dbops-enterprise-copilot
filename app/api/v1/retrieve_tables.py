@@ -1,27 +1,34 @@
 import os
 import json
 from typing import List, Dict, Any, Optional
-from pymilvus import Collection, connections
+from pymilvus import Collection, connections, utility
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# 1. 配置
-MILVUS_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
-MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
-COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "schema_catalog_v2")
+# 🔥 1. 统一配置和日志
+from app.core.config import settings
+from app.core.logger import logger
 
-# 模型路径
+# 配置
+MILVUS_HOST = settings.MILVUS_HOST
+MILVUS_PORT = settings.MILVUS_PORT
+COLLECTION_NAME = "schema_catalog_v2"
+
+# 模型配置 (建议也在 config.py 中定义，这里暂时保持硬编码或读取 env)
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
 RERANK_MODEL_NAME = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 
-# 单例模式加载模型 (防止每次请求都加载)
+# 单例模式加载模型
 _embed_model = None
 _rerank_model = None
+
+# 🔥 全局状态锁：防止重复 Load Collection
+_COLLECTION_LOADED = False
 
 
 def get_embed_model():
     global _embed_model
     if _embed_model is None:
-        print(f"🧠 Loading Embedding Model: {EMBED_MODEL_NAME}...")
+        logger.info(f"🧠 Loading Embedding Model: {EMBED_MODEL_NAME}...")
         _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
     return _embed_model
 
@@ -30,19 +37,37 @@ def get_rerank_model():
     global _rerank_model
     if _rerank_model is None:
         # CrossEncoder 比较大，如果是 CPU 部署要注意内存
-        print(f"🧠 Loading Rerank Model: {RERANK_MODEL_NAME}...")
+        logger.info(f"🧠 Loading Rerank Model: {RERANK_MODEL_NAME}...")
         try:
             _rerank_model = CrossEncoder(RERANK_MODEL_NAME)
         except Exception as e:
-            print(f"⚠️ Rerank model load failed: {e}. Fallback to None.")
+            logger.warning(f"⚠️ Rerank model load failed: {e}. Fallback to None.")
     return _rerank_model
 
 
-# 建立 Milvus 连接
-try:
-    connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
-except Exception as e:
-    print(f"❌ Milvus Connect Error: {e}")
+def ensure_milvus_connection():
+    """
+    确保 Milvus 已连接且 Collection 已加载到内存。
+    使用全局锁 _COLLECTION_LOADED 避免重复加载。
+    """
+    global _COLLECTION_LOADED
+
+    # 1. 建立连接 (pymilvus 内部有连接池管理，多次调用 connect 问题不大，但最好也判断一下)
+    try:
+        connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+    except Exception as e:
+        logger.error(f"❌ Milvus Connect Error: {e}")
+        return
+
+    # 2. 加载 Collection (这是重操作，必须加锁)
+    if not _COLLECTION_LOADED:
+        if utility.has_collection(COLLECTION_NAME):
+            logger.info(f"🔄 Loading collection '{COLLECTION_NAME}' into memory...")
+            Collection(COLLECTION_NAME).load()
+            _COLLECTION_LOADED = True
+            logger.info(f"✅ Collection '{COLLECTION_NAME}' loaded.")
+        else:
+            logger.error(f"❌ Collection '{COLLECTION_NAME}' not found! Please run ETL first.")
 
 
 # ==========================================
@@ -51,7 +76,7 @@ except Exception as e:
 
 def retrieve_tables(query: str, topk: int = 5) -> List[Dict[str, Any]]:
     """
-    为了兼容旧代码的简单的入口
+    简单入口
     """
     return retrieve_tables_advanced(query, top_k_recall=topk * 10, top_k_final=topk)
 
@@ -65,10 +90,13 @@ def retrieve_tables_advanced(query: str, top_k_recall: int = 100, top_k_final: i
     """
     if not query: return []
 
+    # 确保连接和加载状态
+    ensure_milvus_connection()
+
     # --- 1. Recall (Milvus) ---
     try:
         col = Collection(COLLECTION_NAME)
-        col.load()  # 确保加载到内存
+        # 注意：这里不需要再调用 col.load()，因为 ensure_milvus_connection 已经处理了
 
         model = get_embed_model()
         query_vec = model.encode([query], normalize_embeddings=True)[0].tolist()
@@ -104,24 +132,41 @@ def retrieve_tables_advanced(query: str, top_k_recall: int = 100, top_k_final: i
                 })
 
     except Exception as e:
-        print(f"❌ Milvus Search Failed: {e}")
+        logger.error(f"❌ Milvus Search Failed: {e}", exc_info=True)
         return []
 
     # --- 2. Rerank (Cross-Encoder) ---
     reranker = get_rerank_model()
+
+    # 🔥 优化点：如果有重排模型，必须加保护
     if reranker and candidates:
-        # 构造 Pair: [[query, doc1], [query, doc2]...]
-        pairs = [[query, c["text"]] for c in candidates]
-        scores = reranker.predict(pairs)
+        try:
+            # A. 硬截断 (Hard Truncation)
+            # CrossEncoder 处理长文本极慢且耗内存。
+            # Query 截断 256 字符，Document 截断 512 字符
+            pairs = [[query[:256], c["text"][:512]] for c in candidates]
 
-        # 把重排分数写回去
-        for i, c in enumerate(candidates):
-            c["rerank_score"] = float(scores[i])
+            # B. 批处理 (Batching)
+            scores = reranker.predict(
+                pairs,
+                batch_size=32,
+                show_progress_bar=False,
+                num_workers=0  # 避免多进程开销
+            )
 
-        # 按重排分数排序
-        candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+            for i, c in enumerate(candidates):
+                c["rerank_score"] = float(scores[i])
+
+            # 按 Rerank 分数排序
+            candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        except Exception as e:
+            # C. 降级策略 (Fallback)
+            # 如果 Rerank 爆显存/超时/报错，不要抛出异常，而是降级回向量分数
+            logger.error(f"⚠️ [Rerank Failed] Query: {query} | Error: {e}. Fallback to vector score.")
+            candidates.sort(key=lambda x: x["score"], reverse=True)
     else:
-        # 降级：如果没有重排模型，就按向量分数排
+        # 无模型或候选集为空时的默认排序
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
     # --- 3. Cut Off ---
