@@ -34,7 +34,7 @@ def intent_node(state: AgentState):
 
 def retrieve_node(state: AgentState):
     logger.info("[Step 1] Retrieving Tables", extra={"trace_id": state.get("trace_id")})
-    tables = retrieve_tool(state["question"], topk=10)
+    tables = retrieve_tool(state["question"], topk=5)
     return {
         "candidate_tables": tables,
         "retry_count": 0,
