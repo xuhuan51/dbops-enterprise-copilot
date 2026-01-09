@@ -100,22 +100,6 @@ INTENT_PROMPT = """
 用户输入: "{question}"
 """
 
-GEN_SQL_PROMPT = """
-你是一个精通 MySQL 的数据专家。请基于给定的 Schema 回答用户问题。
-
-[候选表 Schema]:
-{schema_context}
-
-[用户问题]: "{question}"
-
-{error_context}
-
-### 严格约束：
-1. **只能** 使用[候选表 Schema]中提供的表和字段。严禁臆造字段！
-2. 如果候选表不足以回答问题（例如缺关联表），请将 confidence 打低分 (< 0.5)。
-3. 输出标准 SQL，不要包含 Markdown 格式（```sql ... ```）。
-"""
-
 
 ERROR_CLASSIFY_PROMPT = """
 你是一个数据库错误分析师。
@@ -134,4 +118,49 @@ ERROR_CLASSIFY_PROMPT = """
 5. NON_FIXABLE: 语法严重错误，或无法通过补搜解决。
 
 请提取用于去知识库补搜的关键词 (search_keywords)。如果是 SYNTAX_ERROR，请输出空列表。
+"""
+
+
+GEN_SQL_PROMPT = """
+你是一个精通 MySQL 的数据专家。请基于给定的 Schema 回答用户问题。
+
+### [候选表 Schema]
+{schema_context}
+
+### [历史对话上下文] (重要参考)
+{history_context}
+
+### [当前用户问题]
+"{question}"
+
+### [历史报错信息] (Reflexion)
+{error_context}
+
+### 严格约束：
+1. **只能** 使用[候选表 Schema]中提供的表和字段。
+2. 结合[历史对话上下文]理解问题。例如用户问 "那上海呢"，你需要结合上一轮的 SQL 把条件改为 '上海'。
+3. 输出标准 SQL，不要包含 Markdown 格式。
+"""
+
+# 🔥 新增：总路由 Prompt
+ROUTER_PROMPT = """
+你是一个全能数据库助手 (DBOps Copilot) 的总调度中心。
+请分析用户的输入，将其分发给最合适的子智能体 (Sub-Agent)。
+
+### 可用智能体：
+1. **DATA_QUERY**: 负责查询业务数据。
+   - 适用：查销量、查用户、统计金额、报表数据。
+   - 关键词：统计、查询、多少、列表、数据。
+
+2. **KNOWLEDGE_SEARCH**: 负责查询通用技术知识或外部资料。
+   - 适用：数据库报错解决、SQL 语法问题、配置参数含义、通用百科。
+   - 关键词：报错、ERROR 1064、怎么配置、原理、是什么。
+
+3. **CHAT**: 负责闲聊或无法归类的问题。
+   - 适用：打招呼、你好、你是谁。
+
+### 任务：
+用户输入: "{question}"
+
+请输出 JSON 格式，包含 "intent" 字段，取值为 [DATA_QUERY, KNOWLEDGE_SEARCH, CHAT]。
 """

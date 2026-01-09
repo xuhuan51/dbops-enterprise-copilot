@@ -9,7 +9,9 @@ from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
-from app.infrastructure.db.mysql import mysql_conn
+
+# ❌ 删除或注释掉原来的 mysql_conn，我们不再依赖它，防止混淆
+# from app.infrastructure.db.mysql import mysql_conn
 
 # 日志路径配置
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -22,7 +24,6 @@ os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 # ==========================================
 
 def _jsonable(v: Any):
-    # ... (保持不变) ...
     if isinstance(v, (datetime, date)):
         return v.isoformat()
     if isinstance(v, Decimal):
@@ -37,7 +38,7 @@ def _jsonable(v: Any):
 
 def append_event(event: dict):
     """
-    写入审计日志 (events.jsonl) - 公共方法，供 API 层记录 Agent 思考过程
+    写入审计日志 (events.jsonl)
     """
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -50,30 +51,19 @@ def append_event(event: dict):
 # 🔥 新增: 安全预检 (Security Pre-check)
 # ==========================================
 def _security_precheck(sql: str):
-    """
-    轻量级静态检查，拦截危险 SQL，避免浪费 DB 连接。
-    """
     sql_upper = sql.strip().upper()
-
-    # 1. 必须是 SELECT 开头
     if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
         raise ValueError("Security: Only SELECT/WITH statements are allowed.")
 
-    # 2. 禁止多语句 (防止 SQL 注入: "SELECT 1; DROP TABLE users;")
-    # 简单检查分号：如果分号后还有非空字符，视为多语句
-    # (注：这只是简单防御，无法处理字符串内含分号的情况，但对 Agent 生成的规范 SQL 够用了)
     if ";" in sql:
         parts = sql.split(";")
         if len(parts) > 1 and any(p.strip() for p in parts[1:]):
             raise ValueError("Security: Multiple statements detected.")
 
-    # 3. 禁止高危关键词 (正则匹配单词边界)
-    # 拦截: DML/DDL, 文件操作, 系统表操作
     forbidden_patterns = [
-        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|GRANT|REVOKE)\b",  # 修改数据
-        r"\bINTO\s+(OUTFILE|DUMPFILE)\b",  # 导出文件
-        r"\bLOAD_FILE\b",  # 读取文件
-        # r"\bINFORMATION_SCHEMA\b",                                    # 可选：禁止查系统表
+        r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|GRANT|REVOKE)\b",
+        r"\bINTO\s+(OUTFILE|DUMPFILE)\b",
+        r"\bLOAD_FILE\b",
     ]
 
     for pattern in forbidden_patterns:
@@ -82,40 +72,59 @@ def _security_precheck(sql: str):
 
 
 # ==========================================
+# 🔌 核心工具：获取 Proxy 连接
+# ==========================================
+def get_proxy_connection():
+    """
+    🔥 关键修改：强制连接到 ShardingSphere Proxy 的逻辑库
+    """
+    # 确保我们在 .env 或 config.py 里配置了 MYSQL_CONNECT_DB=dbops_proxy
+    target_db = getattr(settings, "MYSQL_CONNECT_DB", "dbops_proxy")
+
+    return pymysql.connect(
+        host=settings.MYSQL_HOST,
+        port=int(settings.MYSQL_PORT),  # 必须是 3307
+        user=settings.MYSQL_USER,
+        password=settings.MYSQL_PASSWORD,
+        database=target_db,  # 🚨 必填！否则报 Error 1046
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor,  # 让结果返回字典，方便处理
+        connect_timeout=10
+    )
+
+
+# ==========================================
 # 2. Agent 专用：验证器 (EXPLAIN)
 # ==========================================
 
 def execute_sql_explain(sql: str, trace_id: str = "N/A") -> bool:
-    """
-    【给 LangGraph Agent 使用】
-    1. Python 正则预检 (无 IO 消耗)
-    2. MySQL EXPLAIN (低 IO 消耗 + 超时保护)
-    """
-    # 🔥 1. 先跑轻量级预检，拦住大半恶意或错误的 SQL
+    # 1. 安全检查
     try:
         _security_precheck(sql)
     except ValueError as e:
         print(f"    ⚠️ [Executor][{trace_id}] Pre-check blocked: {e}")
-        raise e  # 直接抛出，不连数据库
+        raise e
 
-    # 🔥 2. 数据库连接层
+    # 2. 数据库执行
     try:
-        with mysql_conn() as conn:
-            cur = conn.cursor()
+        # 🔥 使用新的连接函数
+        with get_proxy_connection() as conn:
+            with conn.cursor() as cur:
+                # 超时保护
+                try:
+                    if hasattr(settings, "SQL_TIMEOUT_MS"):
+                        cur.execute(f"SET SESSION MAX_EXECUTION_TIME={settings.SQL_TIMEOUT_MS}")
+                except Exception:
+                    pass
 
-            # 🛡️ 设置超时 (复用配置)，防止 EXPLAIN 卡死
-            # 有些复杂的 VIEW 或海量 JOIN，EXPLAIN 也会很慢
-            try:
-                if hasattr(settings, "SQL_TIMEOUT_MS"):
-                    cur.execute(f"SET SESSION MAX_EXECUTION_TIME={settings.SQL_TIMEOUT_MS}")
-            except Exception:
-                pass
-
-            cur.execute(f"EXPLAIN {sql}")
-            return True
+                cur.execute(f"EXPLAIN {sql}")
+                return True
 
     except Exception as e:
         print(f"    ❌ [Executor][{trace_id}] EXPLAIN Error: {str(e)[:100]}...")
+        # 调试用：打印一下到底连的哪
+        print(
+            f"      -> DEBUG Info: Host={settings.MYSQL_HOST}, Port={settings.MYSQL_PORT}, DB={getattr(settings, 'MYSQL_CONNECT_DB', 'unknown')}")
         raise e
 
 
@@ -124,7 +133,6 @@ def execute_sql_explain(sql: str, trace_id: str = "N/A") -> bool:
 # ==========================================
 
 def execute_select(user_id: str, sql: str, trace_id: str = None) -> Dict[str, Any]:
-    # ... (这部分保持上一步修改后的状态，记得带上 trace_id 和超时逻辑) ...
     if not trace_id:
         trace_id = str(uuid.uuid4())
 
@@ -134,45 +142,46 @@ def execute_select(user_id: str, sql: str, trace_id: str = None) -> Dict[str, An
     truncated = False
     err = None
 
-    # 🔥 建议：正式执行前也跑一次预检，双重保险
+    # 安全检查
     try:
         _security_precheck(sql)
     except ValueError as e:
-        return {
-            "trace_id": trace_id,
-            "error": str(e),
-            "rows": [],
-            "latency_ms": 0
-        }
+        return {"trace_id": trace_id, "error": str(e), "rows": [], "latency_ms": 0}
 
     try:
-        with mysql_conn() as conn:
-            cur = conn.cursor()
+        # 🔥 使用新的连接函数
+        with get_proxy_connection() as conn:
+            # 注意：get_proxy_connection 默认用了 DictCursor，
+            # 但如果你下游代码依赖 list/tuple 格式，这里可能要改回普通 Cursor。
+            # 为了兼容你的旧代码逻辑（rows = [[v for v in r]...]），我们这里临时覆盖回默认 Cursor
+            conn.cursorclass = pymysql.cursors.Cursor
 
-            try:
-                if hasattr(settings, "SQL_TIMEOUT_MS"):
-                    cur.execute(f"SET SESSION MAX_EXECUTION_TIME={settings.SQL_TIMEOUT_MS}")
-            except Exception:
-                pass
+            with conn.cursor() as cur:
+                try:
+                    if hasattr(settings, "SQL_TIMEOUT_MS"):
+                        cur.execute(f"SET SESSION MAX_EXECUTION_TIME={settings.SQL_TIMEOUT_MS}")
+                except Exception:
+                    pass
 
-            cur.execute(sql)
+                cur.execute(sql)
 
-            if cur.description:
-                columns = [d[0] for d in cur.description]
+                if cur.description:
+                    columns = [d[0] for d in cur.description]
 
-            limit_n = getattr(settings, "RESULT_MAX_ROWS", 1000)
-            data = cur.fetchmany(limit_n + 1)
+                limit_n = getattr(settings, "RESULT_MAX_ROWS", 1000)
+                data = cur.fetchmany(limit_n + 1)
 
-            if len(data) > limit_n:
-                truncated = True
-                data = data[:limit_n]
+                if len(data) > limit_n:
+                    truncated = True
+                    data = data[:limit_n]
 
-            rows = []
-            for r in data:
-                rows.append([_jsonable(x) for x in r])
+                rows = []
+                for r in data:
+                    rows.append([_jsonable(x) for x in r])
 
     except Exception as e:
         err = str(e)
+        print(f"❌ [Select Error] {err}")
 
     latency_ms = int((time.time() - start) * 1000)
 

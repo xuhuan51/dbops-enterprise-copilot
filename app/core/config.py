@@ -9,10 +9,15 @@ load_dotenv(os.path.join(project_root, ".env"))
 class Settings:
     # MySQL 配置
     MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
-    MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
+    # 🔥 核心修改：端口改成 3307 (连接 Proxy)
+    MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3307))
+
+    # 🔥 用户名密码改成连接 Proxy 的 (server.yaml 里的配置)
     MYSQL_USER = os.getenv("MYSQL_USER", "root")
-    MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
-    MYSQL_CONNECT_DB = os.getenv("MYSQL_CONNECT_DB", "mysql")
+    MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD")
+
+    # 🔥 库名改成 Proxy 里的逻辑库名
+    MYSQL_CONNECT_DB = os.getenv("MYSQL_CONNECT_DB", "dbops_proxy")
 
     # SQL 执行超时时间 (毫秒)，默认 10秒
     SQL_TIMEOUT_MS = int(os.getenv("SQL_TIMEOUT_MS", "10000"))

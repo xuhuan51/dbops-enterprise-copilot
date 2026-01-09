@@ -7,6 +7,8 @@ class AgentState(TypedDict):
     trace_id: str
     question: str
     intent: str
+    # 🔥 新增: 聊天记录 (格式: ["User: 北京销量", "AI: 100", "User: 那上海呢"])
+    chat_history: List[str]
 
     # 召回层 (Retrieval Context)
     candidate_tables: List[Dict]
@@ -40,3 +42,10 @@ class ErrorOutput(BaseModel):
     error_type: Literal["MISSING_COLUMN", "MISSING_TABLE", "WRONG_TABLE", "SYNTAX_ERROR", "NON_FIXABLE"]
     analysis: str
     search_keywords: List[str] = Field(description="用于补搜的关键词")
+
+# 🔥 新增: 意图识别的输出结构
+class IntentOutput(BaseModel):
+    intent: Literal["data_query", "sensitive", "non_data"] = Field(
+        description="用户意图分类: data_query(查数据), sensitive(敏感信息), non_data(闲聊)"
+    )
+

@@ -2,11 +2,18 @@ import threading
 import time
 from typing import List, Dict, Any, Optional
 
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from pymilvus import Collection, connections, utility
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from app.core.config import settings
 from app.core.logger import logger
+
+# =========================
+# 🔥 1. 定义 Router (解决 main.py 报错的关键)
+# =========================
+router = APIRouter(tags=["RAG"])
 
 # =========================
 # Config
@@ -23,12 +30,8 @@ DEFAULT_TOP_K_RECALL = int(getattr(settings, "TOP_K_RECALL", 100))
 DEFAULT_TOP_K_RERANK = int(getattr(settings, "TOP_K_RERANK", 20))
 DEFAULT_TOP_K_FINAL = int(getattr(settings, "TOP_K_FINAL", 5))
 
-# ✅ Rerank cutoff threshold (match your observed scale ~0.xx)
-# - Normal queries: top1 often 0.05~0.25+
-# - Irrelevant queries: top1 often near 0.0 (or lower depending on model)
 RERANK_THRESHOLD = float(getattr(settings, "RERANK_THRESHOLD", 0.01))
 SENSITIVE_KEYWORDS = ["工资", "薪水", "底薪", "密码", "密钥", "token", "salary", "password"]
-# ✅ Gap is for confidence logging / downstream decision only (NOT hard cutoff)
 RERANK_WARN_GAP = float(getattr(settings, "RERANK_WARN_GAP", 0.03))
 
 # =========================
@@ -41,6 +44,10 @@ _collection_loaded = False
 _model_lock = threading.Lock()
 _milvus_lock = threading.Lock()
 
+
+# =========================
+# Core Logic Functions (供 Python 内部调用)
+# =========================
 
 def get_embed_model() -> SentenceTransformer:
     global _embed_model
@@ -69,13 +76,14 @@ def get_rerank_model() -> Optional[CrossEncoder]:
 def ensure_milvus_connection() -> bool:
     """
     Ensure Milvus connected and collection loaded once.
-    Return False on failure so caller can fail-fast.
     """
     global _collection_loaded
 
     with _milvus_lock:
         try:
-            connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+            # 检查是否已有连接，没有则连接
+            if not connections.has_connection("default"):
+                connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
         except Exception as e:
             logger.error(f"❌ Milvus Connect Error: {e}")
             return False
@@ -96,9 +104,6 @@ def ensure_milvus_connection() -> bool:
     return True
 
 
-# =========================
-# Public API
-# =========================
 def retrieve_tables(query: str, topk: int = 5) -> List[Dict[str, Any]]:
     """
     Simple entry: recall 10x, rerank DEFAULT_TOP_K_RERANK, final = topk
@@ -111,33 +116,26 @@ def retrieve_tables(query: str, topk: int = 5) -> List[Dict[str, Any]]:
 
     return retrieve_tables_advanced(
         query=query,
-        top_k_recall=max(topk * 10, 30),
+        top_k_recall=max(topk * 10, 50),
         top_k_rerank=DEFAULT_TOP_K_RERANK,
         top_k_final=topk,
     )
 
 
 def retrieve_tables_advanced(
-    query: str,
-    top_k_recall: int = DEFAULT_TOP_K_RECALL,
-    top_k_rerank: int = DEFAULT_TOP_K_RERANK,
-    top_k_final: int = DEFAULT_TOP_K_FINAL,
+        query: str,
+        top_k_recall: int = DEFAULT_TOP_K_RECALL,
+        top_k_rerank: int = DEFAULT_TOP_K_RERANK,
+        top_k_final: int = DEFAULT_TOP_K_FINAL,
 ) -> List[Dict[str, Any]]:
     """
-    Retrieval pipeline:
-      1) Milvus recall (IP on normalized embeddings)
-      2) Rerank only top_k_rerank by vector score using CrossEncoder
-      3) Cutoff by rerank threshold (top1 only)  ✅
-      4) Return top_k_final
-
-    Notes:
-      - gap is NOT used for hard cutoff anymore (to avoid false negatives)
-      - gap is logged for confidence and can be used by downstream (LLM topk selection)
+    Retrieval pipeline: Milvus -> Rerank -> Cutoff
     """
     if not query:
         return []
 
     if not ensure_milvus_connection():
+        # 如果连不上 Milvus，返回空列表而不是报错，防止整个 Agent 挂掉
         return []
 
     t0 = time.perf_counter()
@@ -147,8 +145,10 @@ def retrieve_tables_advanced(
     try:
         col = Collection(COLLECTION_NAME)
 
-        embed_t0 = time.perf_counter()
+        # 加载模型
         model = get_embed_model()
+
+        embed_t0 = time.perf_counter()
         query_vec = model.encode([query], normalize_embeddings=True)[0].tolist()
         embed_ms = (time.perf_counter() - embed_t0) * 1000.0
 
@@ -175,7 +175,7 @@ def retrieve_tables_advanced(
                 seen.add(full_name)
                 candidates.append(
                     {
-                        "score": float(hit.score),  # IP similarity on normalized vectors
+                        "score": float(hit.score),
                         "db": entity.get("db"),
                         "logical_table": entity.get("logical_table"),
                         "full_name": full_name,
@@ -189,20 +189,11 @@ def retrieve_tables_advanced(
 
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        recall_preview = [
-            f"{c['full_name']} vec={c['score']:.4f}"
-            for c in candidates[: min(10, len(candidates))]
-        ]
-        logger.info(
-            f"🧾 [Retrieve] RecallTop-{min(10, len(candidates))}: {recall_preview} | "
-            f"embed_ms={embed_ms:.1f} milvus_ms={milvus_ms:.1f}"
-        )
-
     except Exception as e:
         logger.error(f"❌ Milvus Search Failed: {e}", exc_info=True)
         return []
 
-    # -------- 2) Rerank (only top_k_rerank) --------
+    # -------- 2) Rerank --------
     reranker = get_rerank_model()
     if reranker is not None:
         rerank_pool = candidates[: max(1, min(top_k_rerank, len(candidates)))]
@@ -217,31 +208,11 @@ def retrieve_tables_advanced(
 
             rerank_pool.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-            rerank_preview = [
-                f"{c['full_name']} rerank={c['rerank_score']:.3f} vec={c['score']:.4f}"
-                for c in rerank_pool[: min(10, len(rerank_pool))]
-            ]
-            logger.info(
-                f"🧾 [Retrieve] RerankTop-{min(10, len(rerank_pool))}: {rerank_preview} | rerank_ms={rerank_ms:.1f}"
-            )
-
-            # -------- 3) Cutoff (top1 only) ✅ --------
+            # 3) Cutoff
             top1 = rerank_pool[0].get("rerank_score", -999.0)
-            top2 = rerank_pool[1].get("rerank_score", -999.0) if len(rerank_pool) > 1 else -999.0
-            gap = top1 - top2
-
             if top1 < RERANK_THRESHOLD:
-                logger.info(
-                    f"🛑 [Retrieve] Cutoff: top1 rerank={top1:.3f} < threshold={RERANK_THRESHOLD:.3f}. Return []."
-                )
+                logger.info(f"🛑 [Retrieve] Cutoff: top1 {top1:.3f} < threshold {RERANK_THRESHOLD}. Return [].")
                 return []
-
-            # gap only as confidence signal (no hard cutoff)
-            if gap < RERANK_WARN_GAP:
-                logger.info(
-                    f"⚠️ [Retrieve] Low confidence gap={gap:.3f} (<{RERANK_WARN_GAP:.3f}). "
-                    f"Suggest downstream use more tables (e.g., top_k_llm=5)."
-                )
 
             candidates_final = rerank_pool
 
@@ -253,15 +224,29 @@ def retrieve_tables_advanced(
 
     # -------- 4) Final output --------
     final_results = candidates_final[: max(0, min(top_k_final, len(candidates_final)))]
-
     total_ms = (time.perf_counter() - t0) * 1000.0
-    if final_results:
-        debug_hits = [
-            f"{t['full_name']} vec={t['score']:.4f} rerank={t.get('rerank_score', None)}"
-            for t in final_results
-        ]
-        logger.info(f"✅ [Retrieve] Final Top-{len(final_results)}: {debug_hits} | total_ms={total_ms:.1f}")
-    else:
-        logger.info(f"✅ [Retrieve] No relevant tables found. | total_ms={total_ms:.1f}")
 
+    logger.info(f"✅ [Retrieve] Final Top-{len(final_results)} | total_ms={total_ms:.1f}")
     return final_results
+
+
+# =========================
+# API Endpoints (供 HTTP 调试用)
+# =========================
+
+class RetrieveRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+@router.post("/retrieve")
+async def api_retrieve_tables(req: RetrieveRequest):
+    """
+    测试 RAG 检索效果的独立接口
+    """
+    results = retrieve_tables(req.query, topk=req.top_k)
+    return {
+        "query": req.query,
+        "count": len(results),
+        "results": results
+    }

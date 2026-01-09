@@ -1,0 +1,6 @@
+authority:
+  users:
+    - user: root@%
+      password: 2679622408 # 这是连接 Proxy 的密码，可以设简单点
+  privilege:
+    type: ALL_PERMITTED

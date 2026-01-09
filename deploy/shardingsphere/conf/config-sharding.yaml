@@ -1,0 +1,85 @@
+schemaName: dbops_proxy
+
+dataSources:
+  # 1. 交易中心
+  ds_trade:
+    url: jdbc:mysql://host.docker.internal:3306/corp_trade_center?serverTimezone=UTC&useSSL=false
+    username: root
+    password: 2679622408
+    connectionTimeoutMilliseconds: 30000
+    idleTimeoutMilliseconds: 60000
+    maxLifetimeMilliseconds: 1800000
+    maxPoolSize: 50
+    minPoolSize: 1
+
+  # 2. 用户中心
+  ds_user:
+    url: jdbc:mysql://host.docker.internal:3306/corp_user_center?serverTimezone=UTC&useSSL=false
+    username: root
+    password: 2679622408
+    maxPoolSize: 50
+
+  # 🔥🔥🔥 新增：3. 供应链/ERP
+  ds_scm:
+    url: jdbc:mysql://host.docker.internal:3306/corp_scm_erp?serverTimezone=UTC&useSSL=false
+    username: root
+    password: 2679622408
+    maxPoolSize: 50
+
+  # 🔥🔥🔥 新增：4. 营销中心
+  ds_mkt:
+    url: jdbc:mysql://host.docker.internal:3306/corp_marketing?serverTimezone=UTC&useSSL=false
+    username: root
+    password: 2679622408
+    maxPoolSize: 50
+
+  # 🔥🔥🔥 新增：5. 数据日志
+  ds_log:
+    url: jdbc:mysql://host.docker.internal:3306/corp_data_log?serverTimezone=UTC&useSSL=false
+    username: root
+    password: 2679622408
+    maxPoolSize: 50
+
+rules:
+- !SHARDING
+  tables:
+    # --- 交易分表规则 (保持不变) ---
+    t_order:
+      actualDataNodes: ds_trade.t_order_${000..127}
+      tableStrategy:
+        standard:
+          shardingColumn: oid
+          shardingAlgorithmName: t_order_inline
+      keyGenerateStrategy:
+        column: oid
+        keyGeneratorName: snowflake
+
+    t_order_item:
+      actualDataNodes: ds_trade.t_order_item_${000..127}
+      tableStrategy:
+        standard:
+          shardingColumn: oid
+          shardingAlgorithmName: t_order_inline
+
+    # --- 用户分表规则 (保持不变) ---
+    u_user_base:
+      actualDataNodes: ds_user.u_user_base_${000..063}
+      tableStrategy:
+        standard:
+          shardingColumn: uid
+          shardingAlgorithmName: u_user_inline
+
+  shardingAlgorithms:
+    t_order_inline:
+      type: INLINE
+      props:
+        algorithm-expression: t_order_${String.format("%03d", oid % 128)}
+    u_user_inline:
+      type: INLINE
+      props:
+        algorithm-expression: u_user_base_${String.format("%03d", uid % 64)}
+
+  keyGenerators:
+    snowflake:
+      type: SNOWFLAKE
+

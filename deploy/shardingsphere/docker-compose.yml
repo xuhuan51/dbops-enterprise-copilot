@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  shardingsphere-proxy:
+    image: apache/shardingsphere-proxy:5.3.0
+    container_name: shardingsphere-proxy
+    ports:
+      - "3307:3307"  # 暴露 3307 端口给 Agent 用
+    environment:
+      JVM_OPTS: "-Xmx2g -Xms2g"
+    volumes:
+      - ./conf:/opt/shardingsphere-proxy/conf
+      - ./ext-lib:/opt/shardingsphere-proxy/ext-lib # 挂载驱动
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # 让容器能连上宿主机 MySQL

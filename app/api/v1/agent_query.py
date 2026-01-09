@@ -1,87 +1,83 @@
-import json
 import uuid
 import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from typing import Optional
 
-from app.core.agent_graph import app as agent_app
+# 🔥 核心修改: 导入整个模块，而不是 import master_app
+# 这样能确保我们用到的是 main.py 初始化后的最新对象
+import app.core.master_graph as mg
+
 from app.modules.sql.executor import execute_select
-from app.core.logger import logger  # 🔥 引入统一 Logger
+from app.core.logger import logger
 
 router = APIRouter(tags=["Agent"])
-
 
 class QueryRequest(BaseModel):
     query: str
     user_id: str = "sys_user"
+    session_id: Optional[str] = None
+
 
 
 @router.post("/query")
 async def agent_query(req: QueryRequest):
-    # 1. 生成全链路唯一 ID
     trace_id = str(uuid.uuid4())
+    thread_id = req.session_id or str(uuid.uuid4())
 
-    # 📝 结构化日志
-    logger.info("Request received", extra={
-        "trace_id": trace_id,
-        "event": "request_start",
-        "query": req.query,
-        "user_id": req.user_id
-    })
+    # ... (日志代码不变)
 
     try:
-        # 🔥 核心修复 1: 改用 ainvoke (异步调用)，防止 LangGraph 内部同步操作阻塞主线程
-        final_state = await agent_app.ainvoke({
-            "question": req.query,
-            "trace_id": trace_id,
-            "retry_count": 0
-        })
+        config = {"configurable": {"thread_id": thread_id}}
 
-        intent = final_state.get("intent")
-
-        if intent != "data_query":
-            logger.info("Query blocked or non-data intent", extra={"trace_id": trace_id, "intent": intent})
-            return {
-                "trace_id": trace_id,
-                "success": False,
-                "type": intent,
-                "message": "Guardrail blocked or non-data query."
-            }
-
-        error = final_state.get("validation_error")
-        if error:
-            logger.warning("Agent failed to generate valid SQL", extra={"trace_id": trace_id, "error": error})
-            return {
-                "trace_id": trace_id,
-                "success": False,
-                "error": f"Failed to generate valid SQL: {error}",
-                "steps": final_state.get("retry_count", 0)
-            }
-
-        sql = final_state["generated_sql"]
-        logger.info(f"Executing SQL: {sql}", extra={"trace_id": trace_id})
-
-        # 🔥 核心修复 2: 将同步的 SQL 执行扔到线程池
-        # 避免 execute_select (pymysql) 卡死 Event Loop
-        loop = asyncio.get_running_loop()
-        result_data = await loop.run_in_executor(
-            None,
-            lambda: execute_select(req.user_id, sql, trace_id=trace_id)
+        # 调用 Master Graph
+        final_state = await mg.master_app.ainvoke(
+            {"question": req.query, "trace_id": trace_id},
+            config=config
         )
 
-        # 构造返回
-        result_data["agent_meta"] = {
-            "trace_id": trace_id,
-            "confidence": final_state.get("sql_confidence"),
-            "retries": final_state.get("retry_count"),
-            "retrieved_context": [t['logical_table'] for t in final_state.get('candidate_tables', [])],
-            "tables_used": final_state.get("tables_used", []),
-            "assumptions": final_state.get("assumptions", [])
-        }
+        final_answer = final_state.get("final_answer", "")
+        # 🔥 获取思考步骤 (History)
+        steps = final_state.get("history", [])
 
-        logger.info("Request finished successfully", extra={"trace_id": trace_id})
-        return result_data
+        # =================================================
+        # 分支 A: SQL 任务
+        # =================================================
+        if final_answer.startswith("SQL_RESULT:"):
+            sql = final_answer.replace("SQL_RESULT:", "").strip()
+
+            # 执行 SQL
+            loop = asyncio.get_running_loop()
+            result_data = await loop.run_in_executor(
+                None,
+                lambda: execute_select(req.user_id, sql, trace_id=trace_id)
+            )
+
+            result_data["agent_meta"] = {
+                "trace_id": trace_id,
+                "session_id": thread_id,
+                "intent": "DATA_QUERY",
+                "tables_used": final_state.get("tables_used", []),
+                "steps": steps  # 🔥🔥🔥 核心修改：把步骤返回给客户端
+            }
+            result_data["session_id"] = thread_id
+            return result_data
+
+        # =================================================
+        # 分支 B: 文本任务
+        # =================================================
+        else:
+            return {
+                "trace_id": trace_id,
+                "session_id": thread_id,
+                "success": True,
+                "type": "text",
+                "intent": final_state.get("intent", "UNKNOWN"),
+                "message": final_answer,
+                "steps": steps  # 🔥🔥🔥 核心修改：把步骤返回给客户端
+            }
 
     except Exception as e:
         logger.error("Internal Error", extra={"trace_id": trace_id}, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"[{trace_id}] Internal Error: {str(e)}")
+        # 🔥 为了调试方便，把报错详情直接返回
+        raise HTTPException(status_code=500, detail=str(e))

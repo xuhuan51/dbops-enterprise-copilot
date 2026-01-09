@@ -44,31 +44,44 @@ def retrieve_node(state: AgentState):
 
 def generate_node(state: AgentState):
     trace_id = state.get("trace_id", "N/A")
-    logger.info(f"[Step 2] Generating SQL", extra={"trace_id": trace_id})
+    retry_count = state.get("retry_count", 0)
+    logger.info(f"[Step 2] Generating SQL (Attempt {retry_count + 1})", extra={"trace_id": trace_id})
 
+    # 🔥🔥🔥 核心修改：Schema 注入时带上 db 名字 🔥🔥🔥
     schema_context = "\n".join([
-        f"Table: {t['logical_table']}\nInfo: {t.get('text', '')[:150]}..."
+        f"Table: {t.get('db', 'unknown_db')}.{t['logical_table']}\nInfo: {t.get('text', '')[:2000]}..."
         for t in state["candidate_tables"]
     ])
 
-    error_context = ""
+    # 2. 🔥 构造历史对话上下文
+    history_list = state.get("chat_history", [])
+    # 只取最近 6 轮，防止 Prompt 爆炸
+    history_context = "\n".join(history_list[-6:]) if history_list else "无"
+
+    # 3. 构造错误上下文
+    error_context = "无"
     if state.get("validation_error"):
-        error_context = f"⚠️ [上一次报错]: {state['validation_error']}\n请根据报错修正你的 SQL。"
+        error_context = (
+            f"⚠️ 上一次生成的 SQL 执行失败！\n"
+            f"错误信息: {state['validation_error']}\n"
+            f"请根据错误信息修正 SQL。"
+        )
 
     prompt = GEN_SQL_PROMPT.format(
         schema_context=schema_context,
+        history_context=history_context, # 🔥 注入历史
         question=state["question"],
         error_context=error_context
     )
 
     res = llm.with_structured_output(SQLOutput).invoke(prompt)
 
-    # 🔥 核心修复: 删除了这里的重复死代码，只保留一次 return
     return {
         "generated_sql": res.sql,
         "sql_confidence": res.confidence,
         "tables_used": res.tables_used,
-        "assumptions": res.assumptions
+        "assumptions": res.assumptions,
+        "retry_count": retry_count + 1,
     }
 
 
@@ -127,7 +140,7 @@ def repair_node(state: AgentState):
 
     return {
         "candidate_tables": state["candidate_tables"] + new_tables,
-        "retry_count": state["retry_count"] + 1
+        "retry_count": state["retry_count"]
     }
 
 
@@ -148,13 +161,22 @@ def route_after_validate(state: AgentState):
 
 
 def route_after_classify(state: AgentState):
-    if state["retry_count"] >= 1:
+    # 🔥 核心修改：允许重试 3 次 (0, 1, 2)
+    if state["retry_count"] >= 3:
+        logger.warning("❌ Max retries reached. Giving up.", extra={"trace_id": state.get("trace_id")})
         return END
+
     error_type = state["error_type"]
+
     if error_type == "NON_FIXABLE":
         return END
-    if error_type == "SYNTAX_ERROR":
+
+    # 如果是语法错误，不需要补搜，直接带着报错信息回 Generate 重写
+    if error_type == "SYNTAX_ERROR" or error_type == "MISSING_COLUMN":
+        # 手动增加一次重试计数 (因为没有经过 repair_node)
         return "generate"
+
+        # 如果是缺表，去 Repair 节点补搜
     return "repair"
 
 

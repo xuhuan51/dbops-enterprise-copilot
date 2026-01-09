@@ -1,0 +1,58 @@
+[
+  {
+    "id": "L1_001",
+    "category": "简单查询",
+    "query": "帮我统计一下所有订单的总销售额",
+    "session_id": "sess_001",
+    "expected_intent": "DATA_QUERY",
+    "expected_sql_keywords": ["SUM", "amount", "t_order"]
+  },
+  {
+    "id": "L2_001",
+    "category": "复杂查询 (JOIN + Group)",
+    "query": "统计每个城市的注册用户数量，按数量从大到小排，取前3名",
+    "session_id": "sess_002",
+    "expected_intent": "DATA_QUERY",
+    "expected_sql_keywords": ["GROUP BY", "ORDER BY", "DESC", "LIMIT", "JOIN"]
+  },
+  {
+    "id": "L3_001",
+    "category": "多轮对话-上文",
+    "query": "帮我查一下 2023 年北京地区的手机销量",
+    "session_id": "sess_memory_01",
+    "expected_intent": "DATA_QUERY",
+    "expected_sql_keywords": ["WHERE", "2023", "北京"]
+  },
+  {
+    "id": "L3_002",
+    "category": "多轮对话-下文",
+    "query": "那上海的呢？",
+    "session_id": "sess_memory_01",
+    "expected_intent": "DATA_QUERY",
+    "expected_sql_keywords": ["上海", "2023"]
+  },
+  {
+    "id": "L4_001",
+    "category": "模糊语义/黑话",
+    "query": "看下最近一个月的高价值订单（金额大于1000）有哪些",
+    "session_id": "sess_003",
+    "expected_intent": "DATA_QUERY",
+    "expected_sql_keywords": ["amount > 1000", "NOW()", "DATE_SUB"]
+  },
+  {
+    "id": "L5_001",
+    "category": "非SQL-闲聊",
+    "query": "你好，你是谁？",
+    "session_id": "sess_004",
+    "expected_intent": "CHAT",
+    "expected_sql_keywords": []
+  },
+  {
+    "id": "L5_002",
+    "category": "非SQL-知识搜索",
+    "query": "MySQL 的 binlog 是做什么的？",
+    "session_id": "sess_005",
+    "expected_intent": "KNOWLEDGE_SEARCH",
+    "expected_sql_keywords": []
+  }
+]
