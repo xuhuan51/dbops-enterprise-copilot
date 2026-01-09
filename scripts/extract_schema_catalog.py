@@ -17,7 +17,7 @@ from app.core.prompts import TABLE_CARD_GOVERNANCE_PROMPT
 from app.core.logger import logger
 
 OUTPUT_FILE = settings.OUT_PATH
-MAX_WORKERS = 5  # 🔥 并发数 (根据你的 LLM Rate Limit 调整，太高会报错)
+MAX_WORKERS = 5
 
 # ==========================================
 # 🧹 核心清洗逻辑 (Quality Control)
@@ -26,58 +26,34 @@ SYNONYM_BLACKLIST = re.compile(r"(表|记录|数据|信息|管理|服务|列表|
 
 
 def clean_synonyms(synonyms: list, table_name: str) -> list:
-    """
-    清洗同义词：
-    1. 去掉包含 '表', '记录' 等泛词的词
-    2. 去掉和表名完全一样的词
-    3. 限制数量 (Top 5)
-    """
     clean = []
     seen = set()
-
-    # 优先保留短词 (通常是核心概念)
     for w in sorted(synonyms, key=len):
         w = w.strip()
-        # 过滤空、过滤表名本身、过滤泛词后缀
-        if not w or w == table_name:
-            continue
-        if len(w) > 10:  # 太长的词通常是解释，不是同义词
-            continue
-        if SYNONYM_BLACKLIST.search(w):
-            continue
-
+        if not w or w == table_name: continue
+        if len(w) > 10: continue
+        if SYNONYM_BLACKLIST.search(w): continue
         if w not in seen:
             clean.append(w)
             seen.add(w)
-
     return clean[:5]
 
 
 def extract_key_fields(columns_desc: str) -> str:
-    """
-    从 Schema 描述中提取硬锚点 (Key Fields)
-    规则：提取主键、外键(_id)、时间(_time/_date)、状态(status/type)
-    """
     keys = []
     lines = columns_desc.split('\n')
     for line in lines:
-        # line 格式: "- order_id (bigint) [PK]: 订单ID"
-        # 简单正则提取字段名
         match = re.search(r"- (\w+)", line)
         if not match: continue
         col_name = match.group(1).lower()
-
-        # 锚点策略
-        if " [PK]" in line:  # 主键必选
+        if " [PK]" in line:
             keys.append(col_name)
-        elif col_name.endswith("_id") or col_name.endswith("_code"):  # 外键/编码
+        elif col_name.endswith("_id") or col_name.endswith("_code"):
             keys.append(col_name)
-        elif "status" in col_name or "type" in col_name:  # 核心维度
+        elif "status" in col_name or "type" in col_name:
             keys.append(col_name)
-        elif "amount" in col_name or "price" in col_name or "gmv" in col_name:  # 核心指标
+        elif "amount" in col_name or "price" in col_name or "gmv" in col_name:
             keys.append(col_name)
-
-    # 限制长度，防止 Token 爆炸
     return ", ".join(keys[:8])
 
 
@@ -85,7 +61,6 @@ def extract_key_fields(columns_desc: str) -> str:
 # 基础工具
 # ==========================================
 def get_connection():
-    # 🔥 注意：在多线程里，每个线程必须创建自己的连接，不能共享
     return pymysql.connect(
         host=settings.MYSQL_HOST,
         port=settings.MYSQL_PORT,
@@ -114,34 +89,56 @@ def get_logical_name(table_name: str) -> str:
 
 
 def get_all_tables_list(conn, db_name):
-    """只负责获取表名列表，不负责重的数据操作"""
+    """
+    🔥 修复1：改用 SHOW TABLE STATUS，解决 information_schema 查不到表的问题
+    """
     with conn.cursor() as cur:
-        sql = "SELECT table_name, table_comment FROM information_schema.tables WHERE table_schema=%s AND table_type='BASE TABLE' ORDER BY table_name"
-        cur.execute(sql, (db_name,))
-        rows = cur.fetchall()
-        return [{k.lower(): v for k, v in r.items()} for r in rows]
+        try:
+            # 强制切库
+            cur.execute(f"USE {db_name}")
+            cur.execute(f"SHOW TABLE STATUS")
+            rows = cur.fetchall()
+
+            result = []
+            for r in rows:
+                name = r.get('Name') or r.get('name')
+                comment = r.get('Comment') or r.get('comment') or ""
+                if name:
+                    result.append({"table_name": name, "table_comment": comment})
+
+            return result
+        except Exception as e:
+            print(f"   [WARN] SHOW TABLE STATUS failed: {e}")
+            return []
 
 
 def get_schema_info_str(conn, db_name, table_name):
+    """
+    🔥 修复2：改用 SHOW FULL COLUMNS，解决 information_schema 触发 Proxy 内部 Bug (Error 30000)
+    """
     with conn.cursor() as cur:
-        sql = """
-              SELECT column_name, column_type, column_comment, column_key
-              FROM information_schema.columns
-              WHERE table_schema = %s \
-                AND table_name = %s
-              ORDER BY ordinal_position \
-              """
-        cur.execute(sql, (db_name, table_name))
-        rows = cur.fetchall()
-        columns = [{k.lower(): v for k, v in r.items()} for r in rows]
+        try:
+            # ShardingSphere 对 SHOW FULL COLUMNS 支持很好
+            sql = f"SHOW FULL COLUMNS FROM `{table_name}` FROM `{db_name}`"
+            cur.execute(sql)
+            rows = cur.fetchall()
 
-        col_desc_list = []
-        for c in columns:
-            comment = c.get('column_comment') or ""
-            key = " [PK]" if c.get('column_key') == 'PRI' else ""
-            col_desc_list.append(f"- {c['column_name']} ({c['column_type']}){key}: {comment}")
+            col_desc_list = []
+            for r in rows:
+                # 兼容不同驱动返回的大小写
+                field = r.get('Field') or r.get('field')
+                type_ = r.get('Type') or r.get('type')
+                comment = r.get('Comment') or r.get('comment') or ""
+                key_val = r.get('Key') or r.get('key')
 
-        return "\n".join(col_desc_list)
+                key_mark = " [PK]" if key_val == 'PRI' else ""
+                col_desc_list.append(f"- {field} ({type_}){key_mark}: {comment}")
+
+            return "\n".join(col_desc_list)
+        except Exception as e:
+            # 如果某张表真的查不到，返回空，不要让整个脚本崩掉
+            print(f"   [WARN] Failed to fetch schema for {table_name}: {e}")
+            return f"Error fetching schema: {e}"
 
 
 def get_samples_json(conn, db_name, table_name, limit=3):
@@ -160,20 +157,14 @@ def get_samples_json(conn, db_name, table_name, limit=3):
 # 🧵 线程工作函数 (Worker)
 # ==========================================
 def process_single_logical_table(db, logical_name, physical_table, table_comment):
-    """
-    单个逻辑表的 ETL 处理函数 (在线程池中运行)
-    """
-    # 1. 每个线程建立独立连接
     conn = get_connection()
     try:
-        # 获取元数据
+        # 获取元数据 (现在用 SHOW FULL COLUMNS，稳得一批)
         columns_desc = get_schema_info_str(conn, db, physical_table)
         samples_json = get_samples_json(conn, db, physical_table, limit=3)
 
-        # 2. 提取硬锚点 (Hard Anchors)
         key_fields = extract_key_fields(columns_desc)
 
-        # 3. 调用 LLM (耗时操作)
         prompt = TABLE_CARD_GOVERNANCE_PROMPT.format(
             db=db,
             logical_table=logical_name,
@@ -188,23 +179,20 @@ def process_single_logical_table(db, logical_name, physical_table, table_comment
             llm_resp = chat_completion(prompt)
             llm_data = json.loads(llm_resp)
         except Exception as e:
-            logger.warning(f"⚠️ LLM Failed for {logical_name}: {e}")
+            # LLM 偶尔失败不影响大局
             llm_data = {"summary": f"{logical_name} 数据表", "synonyms": [], "risk_level": "normal",
                         "table_type": "fact"}
 
-        # 4. 🔥 质量优化：同义词清洗
         raw_synonyms = llm_data.get('synonyms', [])
         cleaned_synonyms = clean_synonyms(raw_synonyms, logical_name)
 
-        # 5. 🔥 质量优化：Rich Text 结构重组
-        # 优先展示：业务域 -> 类型 -> 关键字段 -> 总结 -> 同义词 -> 结构
         rich_text = (
             f"表名: {logical_name}\n"
             f"业务域: {llm_data.get('domain_suggestion', 'unknown')}\n"
             f"类型: {llm_data.get('table_type', 'fact')}\n"
-            f"关键字段: {key_fields}\n"  # ⚓️ 硬锚点
+            f"关键字段: {key_fields}\n"
             f"业务描述: {llm_data.get('summary', '')}\n"
-            f"同义词: {','.join(cleaned_synonyms)}\n"  # 🧹 清洗后的
+            f"同义词: {','.join(cleaned_synonyms)}\n"
             f"字段结构:\n{columns_desc}\n"
             f"样本数据:\n{samples_json}"
         )
@@ -220,7 +208,7 @@ def process_single_logical_table(db, logical_name, physical_table, table_comment
                 "risk_level": llm_data.get("risk_level", "normal"),
                 "table_type": llm_data.get("table_type", "unknown"),
                 "summary": llm_data.get("summary", ""),
-                "synonyms": cleaned_synonyms  # 存清洗后的
+                "synonyms": cleaned_synonyms
             },
             "text": rich_text,
             "last_update": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -236,12 +224,9 @@ def process_single_logical_table(db, logical_name, physical_table, table_comment
 
 def main():
     logger.info(f"🚀 Start ETL (Concurrency: {MAX_WORKERS})")
-
-    # 获取主库表清单 (这一步很快，单线程即可)
     conn = get_connection()
     target_dbs = settings.TARGET_DBS
-
-    tasks = []  # (db, logical_name, physical_name, comment)
+    tasks = []
 
     for db in target_dbs:
         db = db.strip()
@@ -250,15 +235,12 @@ def main():
         logger.info(f"📂 Scanning DB: {db}")
         tables = get_all_tables_list(conn, db)
 
-        # 分表归一化
         seen_logical = set()
         for t in tables:
             p_name = t['table_name']
             l_name = get_logical_name(p_name)
             if l_name in seen_logical: continue
-
             seen_logical.add(l_name)
-            # 添加到任务列表
             tasks.append((db, l_name, p_name, t.get('table_comment', '')))
 
     conn.close()
@@ -266,12 +248,8 @@ def main():
     total_tasks = len(tasks)
     logger.info(f"📋 Total Logical Tables to Process: {total_tasks}")
 
-    # 线程池并发处理
     results = []
-
-    # 使用 tqdm 显示进度
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # 提交任务
         future_to_table = {
             executor.submit(process_single_logical_table, db, l_name, p_name, comment): l_name
             for (db, l_name, p_name, comment) in tasks
@@ -286,7 +264,6 @@ def main():
             except Exception as e:
                 logger.error(f"Thread Error: {e}")
 
-    # 写入文件
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         for card in results:

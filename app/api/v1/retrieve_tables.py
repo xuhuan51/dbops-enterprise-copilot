@@ -1,18 +1,19 @@
+import datetime
 import threading
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
 from pymilvus import Collection, connections, utility
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from app.core.config import settings
 from app.core.logger import logger
+from app.modules.sql.executor import append_event  # 记得引入日志记录
 
-# =========================
-# 🔥 1. 定义 Router (解决 main.py 报错的关键)
-# =========================
 router = APIRouter(tags=["RAG"])
 
 # =========================
@@ -32,7 +33,6 @@ DEFAULT_TOP_K_FINAL = int(getattr(settings, "TOP_K_FINAL", 5))
 
 RERANK_THRESHOLD = float(getattr(settings, "RERANK_THRESHOLD", 0.01))
 SENSITIVE_KEYWORDS = ["工资", "薪水", "底薪", "密码", "密钥", "token", "salary", "password"]
-RERANK_WARN_GAP = float(getattr(settings, "RERANK_WARN_GAP", 0.03))
 
 # =========================
 # Singletons + Locks
@@ -44,9 +44,12 @@ _collection_loaded = False
 _model_lock = threading.Lock()
 _milvus_lock = threading.Lock()
 
+# 专门用于跑模型推理的线程池
+_executor = ThreadPoolExecutor(max_workers=3)
+
 
 # =========================
-# Core Logic Functions (供 Python 内部调用)
+# Core Logic Functions
 # =========================
 
 def get_embed_model() -> SentenceTransformer:
@@ -74,14 +77,9 @@ def get_rerank_model() -> Optional[CrossEncoder]:
 
 
 def ensure_milvus_connection() -> bool:
-    """
-    Ensure Milvus connected and collection loaded once.
-    """
     global _collection_loaded
-
     with _milvus_lock:
         try:
-            # 检查是否已有连接，没有则连接
             if not connections.has_connection("default"):
                 connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
         except Exception as e:
@@ -100,42 +98,50 @@ def ensure_milvus_connection() -> bool:
             except Exception as e:
                 logger.error(f"❌ Collection load failed: {e}", exc_info=True)
                 return False
-
     return True
 
 
-def retrieve_tables(query: str, topk: int = 5) -> List[Dict[str, Any]]:
-    """
-    Simple entry: recall 10x, rerank DEFAULT_TOP_K_RERANK, final = topk
-    """
-    # 1. 硬规则过滤 (Circuit Breaker)
+# 辅助函数：在线程池中运行 Embedding (CPU密集)
+def _run_embedding(model, text):
+    return model.encode([text], normalize_embeddings=True)[0].tolist()
+
+
+# 辅助函数：在线程池中运行 Rerank (CPU密集)
+def _run_rerank(model, pairs):
+    return model.predict(pairs, batch_size=32, show_progress_bar=False)
+
+
+# 🔥 改为 async def
+async def retrieve_tables(query: str, topk: int = 5, trace_id: str = "N/A") -> List[Dict[str, Any]]:
+    # 1. 硬规则过滤
     for kw in SENSITIVE_KEYWORDS:
         if kw in query:
             logger.warning(f"🛑 [Security] Query contains sensitive keyword '{kw}'. Blocked.")
             return []
 
-    return retrieve_tables_advanced(
+    # 调用异步的高级检索
+    return await retrieve_tables_advanced(
         query=query,
         top_k_recall=max(topk * 10, 50),
         top_k_rerank=DEFAULT_TOP_K_RERANK,
         top_k_final=topk,
+        trace_id=trace_id # 🔥 记得把 trace_id 传给下面
     )
 
 
-def retrieve_tables_advanced(
+# 🔥 改为 async def
+async def retrieve_tables_advanced(
         query: str,
         top_k_recall: int = DEFAULT_TOP_K_RECALL,
         top_k_rerank: int = DEFAULT_TOP_K_RERANK,
         top_k_final: int = DEFAULT_TOP_K_FINAL,
+        trace_id: str = "N/A"  # 建议加上 trace_id 参数
 ) -> List[Dict[str, Any]]:
-    """
-    Retrieval pipeline: Milvus -> Rerank -> Cutoff
-    """
     if not query:
         return []
 
+    # Milvus 连接检查 (这一步很快，可以同步)
     if not ensure_milvus_connection():
-        # 如果连不上 Milvus，返回空列表而不是报错，防止整个 Agent 挂掉
         return []
 
     t0 = time.perf_counter()
@@ -143,24 +149,30 @@ def retrieve_tables_advanced(
 
     # -------- 1) Recall (Milvus) --------
     try:
+        loop = asyncio.get_running_loop()
         col = Collection(COLLECTION_NAME)
-
-        # 加载模型
         model = get_embed_model()
 
+        # 🔥 异步执行 Embedding (防止阻塞主线程)
         embed_t0 = time.perf_counter()
-        query_vec = model.encode([query], normalize_embeddings=True)[0].tolist()
+        query_vec = await loop.run_in_executor(_executor, _run_embedding, model, query)
         embed_ms = (time.perf_counter() - embed_t0) * 1000.0
 
+        # Milvus 搜索 (IO操作，目前 pymilvus 只有同步版，暂且这样跑，或者也放 executor)
         search_params = {"metric_type": "IP", "params": {"nprobe": 10}}
         milvus_t0 = time.perf_counter()
-        res = col.search(
-            data=[query_vec],
-            anns_field="embedding",
-            param=search_params,
-            limit=top_k_recall,
-            output_fields=["db", "logical_table", "text"],
-        )
+
+        # 将 Milvus 搜索放入线程池
+        def _search_milvus():
+            return col.search(
+                data=[query_vec],
+                anns_field="embedding",
+                param=search_params,
+                limit=top_k_recall,
+                output_fields=["db", "logical_table", "text"],
+            )
+
+        res = await loop.run_in_executor(_executor, _search_milvus)
         milvus_ms = (time.perf_counter() - milvus_t0) * 1000.0
 
         candidates: List[Dict[str, Any]] = []
@@ -195,12 +207,16 @@ def retrieve_tables_advanced(
 
     # -------- 2) Rerank --------
     reranker = get_rerank_model()
+    candidates_final = candidates
+
     if reranker is not None:
         rerank_pool = candidates[: max(1, min(top_k_rerank, len(candidates)))]
         try:
             rerank_t0 = time.perf_counter()
             pairs = [[query[:256], c["text"][:512]] for c in rerank_pool]
-            scores = reranker.predict(pairs, batch_size=32, show_progress_bar=False)
+
+            # 🔥 异步执行 Rerank 推理 (CPU密集)
+            scores = await loop.run_in_executor(_executor, _run_rerank, reranker, pairs)
             rerank_ms = (time.perf_counter() - rerank_t0) * 1000.0
 
             for i, c in enumerate(rerank_pool):
@@ -208,30 +224,49 @@ def retrieve_tables_advanced(
 
             rerank_pool.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-            # 3) Cutoff
+            # Cutoff
             top1 = rerank_pool[0].get("rerank_score", -999.0)
             if top1 < RERANK_THRESHOLD:
                 logger.info(f"🛑 [Retrieve] Cutoff: top1 {top1:.3f} < threshold {RERANK_THRESHOLD}. Return [].")
+                # 这里也可以记一条 cutoff 日志
                 return []
 
             candidates_final = rerank_pool
 
         except Exception as e:
             logger.error(f"⚠️ [Rerank Failed] {e}. Fallback to vector score.", exc_info=True)
-            candidates_final = candidates
-    else:
-        candidates_final = candidates
 
     # -------- 4) Final output --------
     final_results = candidates_final[: max(0, min(top_k_final, len(candidates_final)))]
     total_ms = (time.perf_counter() - t0) * 1000.0
 
-    logger.info(f"✅ [Retrieve] Final Top-{len(final_results)} | total_ms={total_ms:.1f}")
+    # 1. 提取表名列表 (方便查看)
+    table_names = [t["logical_table"] for t in final_results]
+
+    # 🔥 修改点：直接把表名打印在控制台！
+    logger.info(f"✅ [Retrieve] Found {len(final_results)} tables: {table_names} | ms={total_ms:.0f}")
+
+    # 2. 写入审计日志 (events.jsonl)
+    try:
+        append_event({
+            "trace_id": trace_id,
+            "user_id": "system_retriever",
+            "route": "RETRIEVE",
+            "sql": query,
+            "latency_ms": int(total_ms),
+            "truncated": False,
+            "error": None,
+            "result_summary": table_names,  # 这里也会记录
+            "ts_iso": datetime.utcnow().isoformat(),
+        })
+    except Exception:
+        pass
+
     return final_results
 
 
 # =========================
-# API Endpoints (供 HTTP 调试用)
+# API Endpoints
 # =========================
 
 class RetrieveRequest(BaseModel):
@@ -239,12 +274,10 @@ class RetrieveRequest(BaseModel):
     top_k: int = 5
 
 
+# 🔥 路由函数也要改成 async def
 @router.post("/retrieve")
 async def api_retrieve_tables(req: RetrieveRequest):
-    """
-    测试 RAG 检索效果的独立接口
-    """
-    results = retrieve_tables(req.query, topk=req.top_k)
+    results = await retrieve_tables(req.query, topk=req.top_k)
     return {
         "query": req.query,
         "count": len(results),
