@@ -122,7 +122,7 @@ ERROR_CLASSIFY_PROMPT = """
 
 
 GEN_SQL_PROMPT = """
-你是一个精通 MySQL 的数据专家。请基于给定的 Schema 回答用户问题，并输出可执行 SQL。
+你是一个 SQL 生成器。只输出 SQL 语句本身，不要包含 "Generated SQL:"、Markdown 代码块（```sql）或任何解释性文字。 直接以 SELECT 开头。
 
 ### [候选表 Schema - 这是唯一可信来源]
 {schema_context}
@@ -152,9 +152,12 @@ GEN_SQL_PROMPT = """
    - 只能输出一条 SQL（仅 `SELECT` 或 `WITH ... SELECT`）
    - **禁止** `USE/SET/EXPLAIN/SHOW`、禁止 `;`、禁止第二条语句
 
-4) **字段规则**：
-   - 只能使用候选表提供的字段名；不确定字段时不要编造
-   - 若无法确定“销售额/金额”字段，请输出：SELECT 'NEED_SCHEMA_FIELD: amount_column' AS error;
+4) **字段规则**（⚠️ 严格禁止编造字段）：
+   - **只能使用候选表 Schema 中明确列出的字段名**
+   - **严禁**根据业务语义猜测字段名（如：看到"城市"就写 `city`，看到"金额"就写 `amount`）
+   - 如果 Schema 中没有找到所需字段，必须输出错误提示：`SELECT 'NEED_SCHEMA_FIELD: 字段描述' AS error;`
+   - 例如：如果用户问"城市"，但 Schema 中没有 `city`、`region`、`city_name` 等字段，必须输出：`SELECT 'NEED_SCHEMA_FIELD: city' AS error;`
+   - **不要**强行使用不存在的字段生成 SQL，这会导致执行失败
 
 5) **输出格式**：
    - 只输出 SQL 原文，不要解释，不要 Markdown，不要代码块。
@@ -185,4 +188,57 @@ ROUTER_PROMPT = """
 用户输入: "{question}"
 
 请输出 JSON 格式，包含 "intent" 字段，取值为 [DATA_QUERY, KNOWLEDGE_SEARCH, CHAT]。
+"""
+
+REFLECTION_PROMPT = """你是一个严厉的 SQL 审查员。你的任务是检查生成的 SQL 是否精确匹配用户的意图，是否存在“幻觉”、乱用表或逻辑错误。
+
+**上下文信息：**
+1. 用户原始问题：{question}
+2. 检索到的表结构：
+{schema_summary}
+3. Agent 生成的 SQL：{sql}
+
+**审查标准 (必须严格遵守)：**
+
+1. **核心指标一致性 (Metric Alignment)**：
+   - 检查 SQL 计算的指标是否与用户问的物理含义一致。
+   - **反例警告**：如果用户问的是“总金额/总量/数值”（需要 SUM/AVG），SQL 却只用了 COUNT(*)（统计行数），这是严重错误！
+   - **反例警告**：如果用户问的是“A状态”，SQL 却过滤了“B状态”。
+
+2. **表与业务域匹配 (Domain Matching)**：
+   - 检查使用的表在语义上是否真的包含用户想要的数据。
+   - **严禁**“张冠李戴”：例如用户问“交易/销量”，绝不能用“用户表”或“日志表”来强行凑数。如果 Schema 里没有合适的表，必须驳回，不要硬写。
+
+3. **字段真实性 (Field Validity)**：
+   - SQL 中使用的字段必须真实存在于提供的 Schema 中。严禁编造不存在的字段（Hallucination）。
+
+**输出指引：**
+- 如果发现表缺失（Schema 里没有能回答问题的表），请在 suggested_search_keywords 中给出“为了找到正确的表，应该去检索什么业务术语（如：库存、流水、考勤等）”。
+- 如果通过，请确保逻辑无懈可击。
+"""
+
+
+QUERY_REWRITE_PROMPT = """你是一个精通数据库设计（Schema Design）的数据架构师。你的任务是将用户的“业务口语”，翻译成数据库检索时可能命中的“元数据关键词”。
+
+**任务目标**：
+帮助向量检索引擎（RAG）找到正确的表。你需要通过联想，猜测数据库中可能存在的**表名片段**、**字段名**或**业务术语**。
+
+**思考维度（请发散思维）**：
+1. **领域泛化**: 用户问具体事物（如"iPhone"），你要联想到抽象类别（如"商品", "SKU", "sku_name", "product_name"）。
+2. **表名预测**: 
+   - 涉及交易/记账 -> 可能包含 "order", "flow", "trans", "fact"
+   - 涉及人/属性 -> 可能包含 "user", "dim", "profile", "base"
+   - 涉及库存/配置 -> 可能包含 "stock", "config", "setting"
+3. **字段猜测**:
+   - 问"在哪" -> 补充 "city", "province", "location", "address"
+   - 问"多少钱" -> 补充 "amount", "price", "revenue", "cost"
+   - 问"状态" -> 补充 "status", "type", "flag"
+
+**示例**：
+- 输入: "查一下北京的手机退款情况"
+- 输出: "查一下北京的手机退款情况 城市 city address 退货 refund return order 订单 t_refund sku_name amount 售后"
+
+**用户问题**: {question}
+
+请直接输出扩展后的搜索词字符串（保留原问题，用空格分隔，不要输出解释）：
 """

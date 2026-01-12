@@ -1,20 +1,28 @@
-import datetime  # 🔥 新增
-import asyncio  # 🔥 新增
+import datetime
+import warnings
+import re
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
+from langchain_core._api import LangChainBetaWarning
 
-# 🔥 1. 引入统一配置和 Logger
+warnings.filterwarnings("ignore", category=LangChainBetaWarning)
+
 from app.core.config import settings
 from app.core.logger import logger
 
-from app.core.prompts import INTENT_PROMPT, GEN_SQL_PROMPT, ERROR_CLASSIFY_PROMPT
-from app.core.state import AgentState, IntentOutput, SQLOutput, ErrorOutput
-# 引入检索工具 (现在是 async 的了)
+# 引入 Prompt
+from app.core.prompts import (
+    INTENT_PROMPT,
+    GEN_SQL_PROMPT,
+    ERROR_CLASSIFY_PROMPT,
+    REFLECTION_PROMPT,
+    QUERY_REWRITE_PROMPT
+)
+from app.core.state import AgentState, IntentOutput, SQLOutput, ErrorOutput, ReflectionOutput
+
 from app.api.v1.retrieve_tables import retrieve_tables as retrieve_tool
-# 🔥 引入 execute_sql_explain 和 append_event (用于写日志)
 from app.modules.sql.executor import execute_sql_explain, append_event
 
-# --- 初始化模型 ---
 llm = ChatOpenAI(
     model=settings.LLM_MODEL,
     temperature=0,
@@ -25,89 +33,109 @@ llm = ChatOpenAI(
 
 
 # ==========================================
-# Nodes (全部升级为 async def)
+# Nodes (节点定义)
 # ==========================================
 
 async def intent_node(state: AgentState):
+    """Step 0: 识别用户意图"""
     trace_id = state.get("trace_id", "N/A")
-    question = state["question"]  # 获取用户提问
-
+    question = state["question"]
     logger.info("[Step 0] Intent Check", extra={"trace_id": trace_id})
 
-    # 🔥🔥🔥【核心修改】把用户提问写入审计日志 events.jsonl 🔥🔥🔥
+    # 记录 Event
     try:
         append_event({
-            "trace_id": trace_id,
-            "user_id": "real_user",  # 标记这是真实用户
-            "route": "USER_INPUT",  # 标记这是用户输入的环节
-            "sql": question,  # 把“自然语言问题”存在 sql 字段里（或者你也可以加个 text 字段，但复用 sql 字段比较省事）
-            "latency_ms": 0,
-            "truncated": False,
-            "error": None,
-            "ts_iso": datetime.datetime.utcnow().isoformat(),
+            "trace_id": trace_id, "user_id": "real_user", "route": "USER_INPUT",
+            "sql": question, "ts_iso": datetime.datetime.utcnow().isoformat(),
         })
-    except Exception as e:
-        logger.warning(f"Failed to log user input: {e}")
+    except:
+        pass
 
-    # --- 下面是原有的 LLM 逻辑 ---
     prompt = INTENT_PROMPT.format(question=question)
-
-    # 异步调用 LLM
     res = await llm.with_structured_output(IntentOutput).ainvoke(prompt)
-
     return {"intent": res.intent}
 
 
+async def rewrite_node(state: AgentState):
+    """Step 0.5: 问题改写 (翻译官)"""
+    trace_id = state.get("trace_id", "N/A")
+    question = state["question"]
+
+    logger.info("[Step 0.5] Query Rewriting", extra={"trace_id": trace_id})
+
+    # 调用 LLM 进行发散联想
+    prompt = QUERY_REWRITE_PROMPT.format(question=question)
+    response = await llm.ainvoke(prompt)
+    rewritten_query = response.content.strip()
+
+    logger.info(f"🔄 [Rewriter] Origin: {question} -> New: {rewritten_query}", extra={"trace_id": trace_id})
+
+    # 更新 State
+    return {"search_query": rewritten_query}
+
+
 async def retrieve_node(state: AgentState):
-    logger.info("[Step 1] Retrieving Tables", extra={"trace_id": state.get("trace_id")})
+    """Step 1: 检索表结构 (RAG)"""
+    trace_id = state.get("trace_id", "N/A")
+    logger.info("[Step 1] Retrieving Tables", extra={"trace_id": trace_id})
 
-    # 🔥 改为 await 调用 (因为 retrieve_tables 现在是 async 函数)
-    # 注意：这里不需要手动 append_event，因为 retrieve_tables 内部已经加了日志记录
-    tables = await retrieve_tool(state["question"], topk=5, trace_id=state.get("trace_id", "N/A"))
+    # 优先使用改写后的 Query
+    query_text = state.get("search_query") or state["question"]
 
-    return {
-        "candidate_tables": tables,
-        "retry_count": 0,
-        "validation_error": None
-    }
+    tables = await retrieve_tool(query_text, topk=5, trace_id=trace_id)
+    return {"candidate_tables": tables, "retry_count": 0, "validation_error": None}
 
 
 async def generate_node(state: AgentState):
+    """Step 2: 生成 SQL"""
     trace_id = state.get("trace_id", "N/A")
     retry_count = state.get("retry_count", 0)
     logger.info(f"[Step 2] Generating SQL (Attempt {retry_count + 1})", extra={"trace_id": trace_id})
 
-    # 🔥🔥🔥【核心修改点】Schema 注入逻辑优化 🔥🔥🔥
-    # 1. 强行加上 db 前缀 (默认 dbops_proxy)
-    # 2. 缩短 text 长度，防止物理表名干扰
+    # --- 智能 Schema 拼接 ---
     schema_lines = []
     for t in state["candidate_tables"]:
-        # 1. 尝试从检索结果获取 db，如果没有，才回退到 unknown (或者你可以回退到 dbops_proxy 作为保底)
-        db_name = t.get('db')
         table_name = t['logical_table']
+        full_text = t.get('text', '')
 
-        # 2. 动态拼接：如果有库名就拼库名，没库名就裸奔
-        full_table_name = f"{db_name}.{table_name}" if db_name else table_name
+        MAX_LEN = 2000
+        if len(full_text) > MAX_LEN:
+            field_start = full_text.find("字段结构:")
+            if field_start != -1:
+                header = full_text[:field_start]
+                body = full_text[field_start:field_start + 1500]
+                safe_info = header + body + "\n...(Samples Truncated)"
+            else:
+                safe_info = full_text[:MAX_LEN]
+        else:
+            safe_info = full_text
 
-        # 3. 截断 text，防止物理表名干扰
-        safe_info = t.get('text', '')[:500]
-
-        schema_lines.append(f"Table: {full_table_name}\nInfo: {safe_info}")
+        schema_lines.append(f"Table: {table_name}\nInfo: {safe_info}")
 
     schema_context = "\n".join(schema_lines)
 
-    # 历史对话上下文 (保持不变)
+    # --- 注入多轮对话历史 ---
     history_list = state.get("chat_history", [])
-    history_context = "\n".join(history_list[-6:]) if history_list else "无"
+    if history_list:
+        history_context = "\n".join(history_list[-5:])
+    else:
+        history_context = "无 (这是第一轮对话)"
 
-    # 错误上下文 (保持不变)
+    # 上下文处理 (Error Context)
     error_context = "无"
-    if state.get("validation_error"):
-        error_context = (
-            f"⚠️ 上一次生成的 SQL 执行失败！\n"
-            f"错误信息: {state['validation_error']}\n"
-            f"请根据错误信息修正 SQL。"
-        )
+    if state.get("reflection_passed") is False:
+        error_context = f"⚠️ 之前的逻辑被反思驳回：{state.get('reflection_feedback')}"
+    elif state.get("validation_error"):
+        error_msg = state['validation_error']
+        if "Unknown column" in error_msg or "MISSING_COLUMN" in str(state.get("error_type", "")):
+            col_match = re.search(r"['`](\w+)['`]", error_msg)
+            if col_match:
+                missing_col = col_match.group(1)
+                error_context = f"⚠️ 字段 '{missing_col}' 不存在。请检查 Schema，如果确实没有，输出: SELECT 'NEED_SCHEMA_FIELD: {missing_col}' AS error;"
+            else:
+                error_context = f"⚠️ 字段错误：{error_msg}"
+        else:
+            error_context = f"⚠️ 执行报错：{error_msg}"
 
     prompt = GEN_SQL_PROMPT.format(
         schema_context=schema_context,
@@ -116,109 +144,109 @@ async def generate_node(state: AgentState):
         error_context=error_context
     )
 
-    # 异步调用 LLM
     res = await llm.with_structured_output(SQLOutput).ainvoke(prompt)
-
     logger.info(f"🤖 [Generated SQL] {res.sql}", extra={"trace_id": trace_id})
 
-    # 记录日志
     try:
         append_event({
-            "trace_id": trace_id,
-            "user_id": "ai_agent",
-            "route": "GENERATE",
-            "sql": res.sql,
-            "latency_ms": 0,
-            "truncated": False,
-            "error": None,
-            "assumptions": res.assumptions,
-            "ts_iso": datetime.datetime.utcnow().isoformat(),
+            "trace_id": trace_id, "user_id": "ai_agent", "route": "GENERATE",
+            "sql": res.sql, "assumptions": res.assumptions, "ts_iso": datetime.datetime.utcnow().isoformat(),
         })
-    except Exception as e:
-        logger.warning(f"Failed to log generate event: {e}")
-
-    return {
-        "generated_sql": res.sql,
-        "sql_confidence": res.confidence,
-        "tables_used": res.tables_used,
-        "assumptions": res.assumptions,
-        "retry_count": retry_count + 1,
-    }
-
-async def validate_node(state: AgentState):
-    trace_id = state.get("trace_id", "N/A")
-    logger.info("[Step 3] Validating SQL (EXPLAIN)", extra={"trace_id": trace_id})
-
-    sql = state["generated_sql"]
-
-    try:
-        # execute_sql_explain 内部是同步的 pymysql，但可以直接在 async 函数里调用
-        # 它内部已经集成了 append_event，所以这里不需要再写日志
-        execute_sql_explain(sql, trace_id=trace_id)
-        return {"validation_error": None}
-    except Exception as e:
-        error_msg = str(e)
-        logger.warning(f"Validation Failed: {error_msg}", extra={"trace_id": trace_id})
-        return {"validation_error": error_msg}
-
-
-async def classify_node(state: AgentState):
-    trace_id = state.get("trace_id", "N/A")
-    logger.info("[Step 4] Classifying Error", extra={"trace_id": trace_id})
-
-    prompt = ERROR_CLASSIFY_PROMPT.format(
-        sql=state["generated_sql"],
-        error_msg=state["validation_error"]
-    )
-
-    # 异步调用 LLM
-    res = await llm.with_structured_output(ErrorOutput).ainvoke(prompt)
-    logger.info(f"Error Type: {res.error_type}", extra={"trace_id": trace_id})
-
-    # 🔥🔥🔥【新增】记录错误分类决策 🔥🔥🔥
-    try:
-        append_event({
-            "trace_id": trace_id,
-            "user_id": "system_classifier",
-            "route": "CLASSIFY_ERROR",   # 标记动作
-            "sql": state["generated_sql"], # 记录出错的 SQL
-            "error": state["validation_error"], # 记录报错信息
-            "result_summary": f"Type: {res.error_type}, Keywords: {res.search_keywords}", # 记录分类结果
-            "latency_ms": 0,
-            "truncated": False,
-            "ts_iso": datetime.datetime.utcnow().isoformat(),
-        })
-    except Exception:
+    except:
         pass
 
     return {
-        "error_type": res.error_type,
-        "repair_keywords": res.search_keywords
+        "generated_sql": res.sql,
+        # 🔥 修改: 将结果同步到 final_answer，格式必须与 api/agent_query.py 对齐
+        "final_answer": f"SQL_RESULT:{res.sql}",
+        "retry_count": retry_count + 1,
+        "validation_error": None,
+        "reflection_passed": None
     }
 
-    # 🔥 改为异步调用 ainvoke
+
+async def reflection_node(state: AgentState):
+    """Step 2.5: 自我反思"""
+    trace_id = state.get("trace_id", "N/A")
+    logger.info("[Step 2.5] Reflection (Self-Correction)", extra={"trace_id": trace_id})
+
+    # 计数
+    current_count = state.get("reflection_count", 0) + 1
+
+    schema_summary = "\n".join([
+        f"Table: {t['logical_table']}\nSchema: {t.get('text', '')[:800]}"
+        for t in state["candidate_tables"]
+    ])
+
+    prompt = REFLECTION_PROMPT.format(
+        question=state["question"],
+        schema_summary=schema_summary,
+        sql=state["generated_sql"]
+    )
+
+    res = await llm.with_structured_output(ReflectionOutput).ainvoke(prompt)
+
+    try:
+        append_event({
+            "trace_id": trace_id, "user_id": "system_reflection", "route": "REFLECTION",
+            "sql": state["generated_sql"], "result_summary": f"Valid: {res.is_valid}, Reason: {res.reason}",
+            "ts_iso": datetime.datetime.utcnow().isoformat(),
+        })
+    except:
+        pass
+
+    if res.is_valid:
+        logger.info("✅ Reflection Passed.", extra={"trace_id": trace_id})
+        return {
+            "reflection_passed": True,
+            "reflection_feedback": None,
+            "reflection_count": current_count
+        }
+    else:
+        logger.warning(f"❌ Reflection Failed: {res.reason}", extra={"trace_id": trace_id})
+        return {
+            "reflection_passed": False,
+            "reflection_feedback": res.missing_info,
+            "repair_keywords": res.suggested_search_keywords,
+            "reflection_count": current_count
+        }
+
+
+async def validate_node(state: AgentState):
+    """Step 3: 语法验证 (Explain)"""
+    trace_id = state.get("trace_id", "N/A")
+    logger.info("[Step 3] Validating SQL (EXPLAIN)", extra={"trace_id": trace_id})
+    try:
+        execute_sql_explain(state["generated_sql"], trace_id=trace_id)
+        return {"validation_error": None}
+    except Exception as e:
+        logger.warning(f"Validation Failed: {e}", extra={"trace_id": trace_id})
+        return {"validation_error": str(e)}
+
+
+async def classify_node(state: AgentState):
+    """Step 4: 错误分类"""
+    trace_id = state.get("trace_id", "N/A")
+    logger.info("[Step 4] Classifying Error", extra={"trace_id": trace_id})
+    prompt = ERROR_CLASSIFY_PROMPT.format(sql=state["generated_sql"], error_msg=state["validation_error"])
     res = await llm.with_structured_output(ErrorOutput).ainvoke(prompt)
     logger.info(f"Error Type: {res.error_type}", extra={"trace_id": trace_id})
-
-    return {
-        "error_type": res.error_type,
-        "repair_keywords": res.search_keywords
-    }
+    return {"error_type": res.error_type, "repair_keywords": res.search_keywords}
 
 
 async def repair_node(state: AgentState):
+    """Repair: 补充检索"""
     trace_id = state.get("trace_id", "N/A")
-    keywords = state['repair_keywords']
+    keywords = state.get('repair_keywords', [])
+
     logger.info(f"[Repair] Searching supplement: {keywords}", extra={"trace_id": trace_id})
 
     new_tables = []
     current_full_names = {t.get('full_name') for t in state["candidate_tables"]}
 
     for kw in keywords:
-        repair_query = f"{state['question']} {kw}"
-        # 这里调用的 retrieve_tool 内部会记一条 RETRIEVE 日志
+        repair_query = f"{kw} table schema"
         found = await retrieve_tool(repair_query, topk=2, trace_id=trace_id)
-
         for t in found:
             t_full_name = t.get('full_name')
             if t_full_name and t_full_name not in current_full_names:
@@ -226,73 +254,101 @@ async def repair_node(state: AgentState):
                 current_full_names.add(t_full_name)
 
     logger.info(f"[Repair] Added {len(new_tables)} new tables.", extra={"trace_id": trace_id})
+    return {"candidate_tables": state["candidate_tables"] + new_tables}
 
-    # 🔥🔥🔥【新增】记录修复摘要 🔥🔥🔥
-    try:
-        append_event({
-            "trace_id": trace_id,
-            "user_id": "system_repair",
-            "route": "REPAIR_ACTION", # 标记动作
-            "sql": f"Repair Keywords: {keywords}", # 记录用了什么词修补
-            "result_summary": f"Added {len(new_tables)} tables to context", # 记录结果
-            "latency_ms": 0,
-            "truncated": False,
-            "error": None,
-            "ts_iso": datetime.datetime.utcnow().isoformat(),
-        })
-    except Exception:
-        pass
 
+async def fallback_node(state: AgentState):
+    """🔥 Step 5: 最终兜底 (当尝试多次仍失败时，生成友好回复)"""
+    trace_id = state.get("trace_id", "N/A")
+    logger.info("[Step 5] Fallback (Give Up)", extra={"trace_id": trace_id})
+
+    # 获取最后一次的反思反馈
+    feedback = state.get("reflection_feedback", "无法生成有效的 SQL 查询")
+
+    # 构造友好的回复
+    friendly_msg = (
+        f"🤔 抱歉，我尝试查询了数据，但发现缺少支持该问题的字段或表信息。\n"
+        f"原因分析: {feedback}\n\n"
+        f"💡 建议：您可以尝试询问现有数据（如：订单金额、用户注册时间、商品名称等），或者联系管理员补充相关数据源。"
+    )
+
+    # 返回非数据意图，防止 API 解析 SQL
     return {
-        "candidate_tables": state["candidate_tables"] + new_tables,
-        "retry_count": state["retry_count"]
+        "final_answer": friendly_msg,
+        "intent": "non_data"
     }
 
 
 # ==========================================
-# Edges & Graph (这部分逻辑不变)
+# Edges & Routing (工作流定义)
 # ==========================================
 
 def route_after_intent(state: AgentState):
     if state["intent"] == "data_query":
-        return "retrieve"
+        return "rewrite"
     return END
 
 
+def route_after_reflection(state: AgentState):
+    # 1. 如果反思通过，正常走下一步
+    if state.get("reflection_passed"):
+        return "validate"
+
+    # 2. 🔥 熔断 -> 去兜底节点 (而不是直接 END)
+    if state.get("reflection_count", 0) >= 3:
+        logger.error("🛑 Reflection Loop Limit Reached. Routing to Fallback.")
+        return "fallback"
+
+    # 3. 如果没通过且没超限，去修补
+    return "repair"
+
+
 def route_after_validate(state: AgentState):
-    if not state.get("validation_error"):
-        return END
+    if not state.get("validation_error"): return END
     return "classify"
 
 
 def route_after_classify(state: AgentState):
-    if state["retry_count"] >= 3:
-        logger.warning("❌ Max retries reached. Giving up.", extra={"trace_id": state.get("trace_id")})
-        return END
-
-    error_type = state["error_type"]
-    if error_type == "NON_FIXABLE":
-        return END
-    if error_type == "SYNTAX_ERROR" or error_type == "MISSING_COLUMN":
-        return "generate"
+    if state["retry_count"] >= 3: return END
+    if state["error_type"] == "NON_FIXABLE": return END
+    if state["error_type"] in ["SYNTAX_ERROR", "MISSING_COLUMN"]: return "generate"
     return "repair"
 
 
+# 构建图
 workflow = StateGraph(AgentState)
-# 添加节点 (现在它们都是 async 的了)
+
+# 添加节点
 workflow.add_node("intent", intent_node)
+workflow.add_node("rewrite", rewrite_node)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("generate", generate_node)
+workflow.add_node("reflection", reflection_node)
 workflow.add_node("validate", validate_node)
 workflow.add_node("classify", classify_node)
 workflow.add_node("repair", repair_node)
+# 🔥 注册 Fallback 节点
+workflow.add_node("fallback", fallback_node)
 
+# 设置连线
 workflow.set_entry_point("intent")
-workflow.add_conditional_edges("intent", route_after_intent)
+
+workflow.add_conditional_edges("intent", route_after_intent, {"rewrite": "rewrite", END: END})
+workflow.add_edge("rewrite", "retrieve")
 workflow.add_edge("retrieve", "generate")
-workflow.add_edge("generate", "validate")
+
+workflow.add_edge("generate", "reflection")
+
+# 🔥 更新路由表: 加入 fallback
+workflow.add_conditional_edges("reflection", route_after_reflection,
+                               {"validate": "validate", "repair": "repair", "fallback": "fallback"})
+
 workflow.add_conditional_edges("validate", route_after_validate)
 workflow.add_conditional_edges("classify", route_after_classify, {"repair": "repair", "generate": "generate", END: END})
+
 workflow.add_edge("repair", "generate")
+
+# 🔥 Fallback 结束后终止
+workflow.add_edge("fallback", END)
 
 app = workflow.compile()
