@@ -36,7 +36,7 @@ def run_tests():
         start_time = time.time()
         try:
             # 发送请求
-            resp = requests.post(API_URL, json=payload, timeout=30)
+            resp = requests.post(API_URL, json=payload, timeout=60)
             duration = round(time.time() - start_time, 2)
 
             # 3. 验证结果
