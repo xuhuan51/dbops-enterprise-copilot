@@ -13,12 +13,8 @@ from app.core.agent_graph import app as query_agent_app
 # 🔥 补回丢失的 DB 配置 (main.py 需要用到)
 # ==========================================
 DB_CONFIG = {
-    "host": settings.MYSQL_HOST,  # 保持不变 (127.0.0.1)
-
-    # 🔥 核心修改：强制写死 3306
-    # 因为 settings.MYSQL_PORT 现在是 3307 (Proxy)，记忆库必须走物理通道
-    "port": 3306,
-
+    "host": settings.MYSQL_HOST,
+    "port": 3306,  # 强制走物理端口，避开 Proxy
     "user": settings.MYSQL_USER,
     "password": settings.MYSQL_PASSWORD,
     "db": "dbops_memory",
@@ -40,7 +36,7 @@ class MasterState(TypedDict):
     intent: str
     final_answer: str
     trace_id: str
-    history: List[str]
+    history: List[str]  # 主图这里存字符串列表没问题
 
 
 # --- 定义路由输出 ---
@@ -54,20 +50,33 @@ class RouterOutput(BaseModel):
 def router_node(state: MasterState):
     print(f"🚦 [Master] Routing query: {state['question']}")
     current_history = state.get("history", [])
+
+    # 构造 Prompt
     prompt = ROUTER_PROMPT.format(question=state["question"])
-    res = llm.with_structured_output(RouterOutput).invoke(prompt)
-    print(f"    -> Route to: {res.intent}")
-    return {"intent": res.intent, "history": current_history}
+
+    # 调用 LLM 决策
+    try:
+        res = llm.with_structured_output(RouterOutput).invoke(prompt)
+        intent = res.intent
+    except Exception as e:
+        print(f"⚠️ Router LLM failed: {e}, fallback to CHAT")
+        intent = "CHAT"
+
+    print(f"    -> Route to: {intent}")
+    return {"intent": intent, "history": current_history}
 
 
 async def search_agent_node(state: MasterState):
     print("🌐 [Search Agent] Searching knowledge...")
+    # 简单模拟搜索
     res = await llm.ainvoke(f"请简要回答这个技术问题: {state['question']}")
+    # 更新历史：统一转为字符串格式
     new_history = state.get("history", []) + [f"User: {state['question']}", f"AI: {res.content}"]
     return {"final_answer": res.content, "history": new_history}
 
 
 async def chat_node(state: MasterState):
+    # 简单闲聊
     res = await llm.ainvoke(f"请用亲切的语气回复用户: {state['question']}")
     new_history = state.get("history", []) + [f"User: {state['question']}", f"AI: {res.content}"]
     return {"final_answer": res.content, "history": new_history}
@@ -77,21 +86,33 @@ async def call_query_agent(state: MasterState):
     print("📊 [Query Agent] Activated.")
     global_history = state.get("history", [])
     recent_history = global_history[-6:]
+
     inputs = {
         "question": state["question"],
         "trace_id": state.get("trace_id"),
-        "chat_history": recent_history
+        # 🔥🔥🔥 核心修复：key 必须是 "history"，对应 AgentState 定义 🔥🔥🔥
+        # 原来写的是 "chat_history"，导致子 Agent 拿不到历史
+        "history": recent_history
     }
+
+    # 调用子图
     result_state = await query_agent_app.ainvoke(inputs)
 
+    # 解析结果
     final_ans = ""
     if result_state.get("generated_sql"):
+        # 优先展示 SQL
         final_ans = f"SQL_RESULT:{result_state['generated_sql']}"
         ai_msg = f"Generated SQL: {result_state['generated_sql']}"
+    elif result_state.get("final_answer"):
+        # 如果有兜底回复 (比如 Fallback)
+        final_ans = result_state["final_answer"]
+        ai_msg = final_ans
     else:
         final_ans = "抱歉，无法生成有效的查询语句。"
         ai_msg = "Failed to generate SQL"
 
+    # 更新主图历史
     new_history = global_history + [f"User: {state['question']}", f"AI: {ai_msg}"]
     return {"final_answer": final_ans, "history": new_history}
 

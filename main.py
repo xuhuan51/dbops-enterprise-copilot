@@ -86,6 +86,19 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
-    # "main:app" 对应 文件名:变量名
-    # reload=True 方便你改代码后自动重启
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    import os
+
+    # 获取环境变量，如果没有设置，默认为 False (关闭热重载)
+    # 这样只有你在开发时显式开启才会有 reload，跑测试脚本时更稳定
+    is_reload = os.getenv("UVICORN_RELOAD", "True").lower() == "true"
+
+    print(f"🚀 Starting Uvicorn with reload={is_reload}")
+
+    # 建议 1: 在 Windows 跑这种重型 AI 应用，强烈建议把 reload 设为 False
+    # 建议 2: 如果必须要热重载，请确保不要在跑高并发测试脚本时修改代码
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=False  # <--- 🚨 核心修改：这里暂时改为 False
+    )

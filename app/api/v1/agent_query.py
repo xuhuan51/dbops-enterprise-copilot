@@ -1,170 +1,63 @@
-import uuid
-import asyncio
-import re
-from typing import Optional
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-
-# 🔥 引入 LangChain 组件，用于最后的数据总结
-from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
-
-# 🔥 引入配置和分析师 Prompt
-from app.core.config import settings
-from app.core.prompts import DATA_SUMMARY_PROMPT
-
-# 引入核心图和组件
-import app.core.master_graph as mg
-from app.modules.sql.executor import execute_select
+import time
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from app.services.agent_service import AgentService
+from app.schemas.response import StandardResponse  # 假设你定义在这里
 from app.core.logger import logger
 
-router = APIRouter(tags=["AI Agent Query"])
-
-# 🔥🔥🔥 实例化一个负责总结的轻量级 LLM (Analyst)
-summary_llm = ChatOpenAI(
-    model=settings.LLM_MODEL,
-    temperature=0.7,  # 稍微有点温度，让回答更自然
-    api_key=settings.LLM_API_KEY,
-    base_url=settings.LLM_BASE_URL,
-    max_tokens=1024
-)
+router = APIRouter()
+agent_service = AgentService()
 
 
-class AgentQueryRequest(BaseModel):
-    query: str
-    user_id: str = "sys_user"
-    session_id: Optional[str] = None
+@router.post("/query", response_model=StandardResponse)
+async def query_agent(payload: dict):
+    start_ts = time.time()
+    user_id = payload.get("user_id", "anonymous")
+    query = payload.get("query", "")
+    session_id = payload.get("session_id")
 
-
-@router.post("/query")
-async def agent_query_endpoint(req: AgentQueryRequest):
-    """
-    AI Agent 接口：
-    输入：自然语言 (e.g. "帮我查一下北京的销量")
-    输出：执行结果 + 思考步骤 (steps) + AI总结 (message)
-    """
-    trace_id = str(uuid.uuid4())
-    thread_id = req.session_id or str(uuid.uuid4())
+    # 结果容器
+    response_payload = {
+        "success": False,
+        "message": "",
+        "data": [],
+        "meta": {}
+    }
 
     try:
-        # LangGraph 配置
-        config = {"configurable": {"thread_id": thread_id}}
+        # 1. 调用业务逻辑
+        # Service 层返回的通常是 dict: {"message": "...", "data": [...], "sql": "...", "trace_id": "..."}
+        result = await agent_service.process_query(query, user_id, session_id)
 
-        # 1. 调用 Master Graph (异步)
-        final_state = await mg.master_app.ainvoke(
-            {"question": req.query, "trace_id": trace_id},
-            config=config
-        )
+        # 2. 映射字段 (Mapping)
+        # 无论 Service 返回什么，这里负责转换成标准格式
+        response_payload["success"] = result.get("success", True)  # Service 可能显式返回 False
+        response_payload["message"] = result.get("message", "")  # Analyst 的话
+        response_payload["data"] = result.get("data", [])  # 表格数据
 
-        final_answer = final_state.get("final_answer", "")
-        steps = final_state.get("history", [])
+        # 3. 组装元数据 (Meta) - 给前端 Debug 或展示 SQL 用
+        response_payload["meta"] = {
+            "trace_id": result.get("trace_id"),
+            "intent": result.get("intent", "UNKNOWN"),
+            "sql": result.get("sql"),  # 前端可能想展示生成的 SQL
+            "steps": result.get("steps", []),  # 如果前端要画流程图
+            "duration": round(time.time() - start_ts, 2)
+        }
 
-        # =================================================
-        # 分支 A: SQL 任务 (Agent 决定查库)
-        # =================================================
-        if final_answer and final_answer.startswith("SQL_RESULT:"):
-            sql = final_answer.replace("SQL_RESULT:", "").strip()
-
-            # SQL 安全检查
-            forbidden_pattern = re.compile(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|GRANT|REVOKE)\b",
-                                           re.IGNORECASE)
-            if forbidden_pattern.search(sql):
-                return {
-                    "trace_id": trace_id, "success": False,
-                    "error": "Security Alert: Dangerous SQL detected.",
-                    "intent": "DATA_QUERY", "steps": steps
-                }
-
-            # 执行 SQL
-            loop = asyncio.get_running_loop()
-            try:
-                result_data = await loop.run_in_executor(
-                    None,
-                    lambda: execute_select(req.user_id, sql, trace_id=trace_id)
-                )
-            except Exception as e:
-                return {
-                    "trace_id": trace_id, "success": False,
-                    "error": f"Execution Failed: {str(e)}",
-                    "intent": "DATA_QUERY", "steps": steps
-                }
-
-            # 🔥🔥🔥 核心升级: AI 分析师介入 (The Analyst Node) 🔥🔥🔥
-            rows = result_data.get("data", [])
-            row_count = len(rows) if isinstance(rows, list) else 0
-
-            # 1. 格式化执行过程 (History Formatting)
-            # 将 list 类型的 steps 转换为字符串，供 LLM 参考
-            process_history_str = ""
-            if steps:
-                for i, step in enumerate(steps):
-                    # 简单转字符串，并截断过长内容防止 Token 溢出
-                    step_content = str(step)[:300]
-                    process_history_str += f"[Step {i+1}] {step_content}\n"
-            else:
-                process_history_str = "无详细执行记录"
-
-            # 2. 截取数据预览
-            data_preview = str(rows[:10])
-
-            # 3. 构造分析师 Prompt (注入了 process_history)
-            summary_prompt = DATA_SUMMARY_PROMPT.format(
-                question=req.query,
-                process_history=process_history_str, # <--- 新增字段
-                sql=sql,
-                max_rows=10,
-                data_preview=data_preview
-            )
-
-            logger.info("🧠 [Analyst] Analyzing process & data...", extra={"trace_id": trace_id})
-
-            summary_text = ""
-            try:
-                # 异步调用 LLM 生成人话
-                ai_response = await summary_llm.ainvoke([HumanMessage(content=summary_prompt)])
-                summary_text = ai_response.content
-            except Exception as e:
-                logger.error(f"Summary Generation Failed: {e}")
-                summary_text = f"查询成功，共找到 {row_count} 条数据，详情请见下方列表。"
-
-            # 打印日志
-            logger.info(f"🗣️ [Analyst Reply] {summary_text}", extra={"trace_id": trace_id})
-            logger.info(f"🔢 [SQL Data] Rows: {row_count} | Preview: {str(rows)[:100]}...", extra={"trace_id": trace_id})
-
-            # 构造最终返回
-            result_data["agent_meta"] = {
-                "trace_id": trace_id,
-                "session_id": thread_id,
-                "intent": "DATA_QUERY",
-                "tables_used": final_state.get("tables_used", []),
-                "generated_sql": sql,
-                "steps": steps
-            }
-            # 🔥 把 AI 生成的总结塞进 message 字段
-            result_data["message"] = summary_text
-            result_data["session_id"] = thread_id
-
-            return result_data
-
-        # =================================================
-        # 分支 B: 纯文本任务 (闲聊 / 知识问答 / 熔断兜底)
-        # =================================================
-        else:
-            final_message = final_state.get("intent", "UNKNOWN")
-            reply_content = final_answer
-
-            logger.info(f"💬 [Text Reply] {reply_content}", extra={"trace_id": trace_id})
-
-            return {
-                "trace_id": trace_id,
-                "session_id": thread_id,
-                "success": True,
-                "type": "text",
-                "intent": final_message,
-                "message": reply_content,
-                "steps": steps
-            }
+        # 特殊处理：如果 Service 返回了 error 字段，视为业务失败
+        if result.get("error"):
+            response_payload["success"] = False
+            # 如果 message 是空的，把 error 填进去
+            if not response_payload["message"]:
+                response_payload["message"] = f"查询处理异常: {result.get('error')}"
 
     except Exception as e:
-        logger.error("Agent Internal Error", extra={"trace_id": trace_id}, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Agent Error: {str(e)}")
+        # 4. 兜底异常捕获 (Catch-All)
+        # 就算 Service 炸了，接口也不能炸，要优雅地返回 JSON
+        logger.error(f"API Endpoint Error: {str(e)}", exc_info=True)
+        response_payload["success"] = False
+        response_payload["message"] = f"系统内部错误: {str(e)}"
+        response_payload["meta"]["duration"] = round(time.time() - start_ts, 2)
+        # 这里可以选择是否返回 500 状态码，或者保持 200 但 success=False
+        # 通常建议保持 200，让前端根据 success 字段判断
+
+    return response_payload
