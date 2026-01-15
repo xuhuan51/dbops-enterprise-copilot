@@ -66,19 +66,36 @@ def _extract_columns_from_ddl(text: str) -> list[str]:
 def _lint_sql_columns(sql: str, table_columns: dict) -> str | None:
     """
     Defense Line 2: Static SQL Linting.
-    Checks if alias.column references exist in the whitelist.
-    Returns the first hallucinated column name if found.
+    1. 检查是否使用了被禁止的 JSON 函数 (新增功能)
+    2. 检查字段是否在白名单内
+    Returns: 造成错误的列名或关键词
     """
     if not table_columns or not sql:
         return None
 
     sql_lower = sql.lower()
+
+    # ============================================================
+    # 🔥🔥🔥 核心新增：JSON 关键词强力拦截 🔥🔥🔥
+    # 只要 SQL 里出现了 JSON 解析函数，直接视为幻觉，强制拦截！
+    # ============================================================
+    forbidden_keywords = ["json_extract", "json_unquote", "->", "->>"]
+    for kw in forbidden_keywords:
+        if kw in sql_lower:
+            logger.warning(f"🛑 [Lint] Detected Forbidden JSON Operation: '{kw}'. Blocking...")
+            # 返回一个特殊的标记，这会触发 generate_node 生成 ERR::NEED_SCHEMA_FIELD 报错
+            return f"FORBIDDEN_JSON_OP({kw})"
+
+    # ============================================================
+    # 以下是原有的白名单检查逻辑 (保持不变)
+    # ============================================================
     table_columns_lower = {
         t_name: {c.lower() for c in cols}
         for t_name, cols in table_columns.items()
     }
 
     alias_map = {}
+    # 正则提取表别名: FROM table AS t 或 JOIN table t
     table_pattern = r"(?:from|join)\s+(?:[`']?[\w]+[`']?\.)?[`']?([a-zA-Z0-9_]+)[`']?(?:\s+(?:as\s+)?)?([`']?[a-zA-Z0-9_]+[`']?)?"
 
     matches = re.finditer(table_pattern, sql_lower)
@@ -87,6 +104,7 @@ def _lint_sql_columns(sql: str, table_columns: dict) -> str | None:
         alias = m.group(2).strip('`\'"') if m.group(2) else t_name
         alias_map[alias] = t_name
 
+    # 正则提取字段引用: t.column
     col_pattern = r"([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)"
     col_matches = re.finditer(col_pattern, sql_lower)
 
@@ -386,31 +404,77 @@ async def generate_node(state: AgentState):
 
 
 async def reflection_node(state: AgentState):
-    """Step 2.5: Self-Reflection"""
+    """Step 2.5: Self-Reflection (智能策略版)"""
     trace_id = state.get("trace_id", "N/A")
     logger.info("[Step 2.5] Reflection", extra={"trace_id": trace_id})
-    current_count = state.get("reflection_count", 0) + 1
 
-    schema_summary = "\n".join([f"Table: {t['logical_table']}" for t in state["candidate_tables"]])
+    # 获取当前是第几次尝试 (注意：generate_node 运行后，retry_count 已经更新)
+    # 第一次正常生成时，retry_count 通常为 1
+    current_retry = state.get("retry_count", 0)
+
+    # 反思计数器 (防止反思死循环)
+    reflection_count = state.get("reflection_count", 0) + 1
+
+    sql = state.get("generated_sql", "")
+
+    # ============================================================
+    # 🧠 智能放行与补救策略 (Smart Pass-Through & Rescue)
+    # ============================================================
+    if "ERR::" in sql:
+        # 提取错误类型
+        is_missing_table = "NO_RELEVANT_TABLE" in sql
+        is_missing_field = "NEED_SCHEMA_FIELD" in sql
+
+        # 策略 1: 初次尝试就缺表 (Partial Recall) -> 强行驳回，触发 Repair 补搜
+        # 场景：比如只找到了订单明细表，缺了订单主表，导致无法筛选金额
+        if is_missing_table and current_retry <= 1:
+            logger.warning("🔄 [Reflection] First attempt failed (Missing Table). Triggering Repair...",
+                           extra={"trace_id": trace_id})
+            return {
+                "reflection_passed": False,
+                # 给 Repair 节点的提示，引导它去搜索核心实体表
+                "reflection_feedback": "当前检索结果不完整，缺少了核心业务表（如主表）。请尝试搜索缺失的业务概念。",
+                "suggested_search_keywords": [f"main table for {state['question']}"],
+                "reflection_count": reflection_count
+            }
+
+        # 策略 2: 已经是重试后的失败，或者只是缺字段 -> 认命，直接放行 (Fail-Closed)
+        # 这样流程会走到 validate -> process_query，最终由 Analyst 礼貌地告诉用户“没查到”
+        logger.info("✅ [Reflection] Fail-Closed triggered (Accepted).", extra={"trace_id": trace_id})
+        return {
+            "reflection_passed": True,
+            "reflection_count": reflection_count,
+            "reflection_feedback": "System Logic: Accepted Fail-Closed response."
+        }
+
+    # ============================================================
+    # 🤖 常规 LLM 反思 (针对生成的 SQL)
+    # ============================================================
+    schema_summary = "\n".join([f"Table: {t['logical_table']}" for t in state.get("candidate_tables", [])])
 
     prompt = REFLECTION_PROMPT.format(
         question=state["question"],
         schema_summary=schema_summary,
-        sql=state["generated_sql"]
+        sql=sql
     )
 
-    res = await llm.with_structured_output(ReflectionOutput).ainvoke(prompt)
+    try:
+        res = await llm.with_structured_output(ReflectionOutput).ainvoke(prompt)
+    except Exception as e:
+        logger.error(f"Reflection LLM failed: {e}")
+        # 如果反思模型挂了，默认放行，防止系统卡死
+        return {"reflection_passed": True, "reflection_count": reflection_count}
 
     if res.is_valid:
         logger.info("✅ Reflection Passed.", extra={"trace_id": trace_id})
-        return {"reflection_passed": True, "reflection_count": current_count}
+        return {"reflection_passed": True, "reflection_count": reflection_count}
     else:
         logger.warning(f"❌ Reflection Failed: {res.reason}", extra={"trace_id": trace_id})
         return {
             "reflection_passed": False,
             "reflection_feedback": res.missing_info,
             "suggested_search_keywords": res.suggested_search_keywords,
-            "reflection_count": current_count
+            "reflection_count": reflection_count
         }
 
 

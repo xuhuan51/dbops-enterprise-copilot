@@ -225,6 +225,8 @@ ROUTER_PROMPT = """
 
 请输出 JSON 格式，包含 "intent" 字段，取值为 [DATA_QUERY, KNOWLEDGE_SEARCH, CHAT]。
 """
+
+
 REFLECTION_PROMPT = """你是一名务实且经验丰富的 SQL 专家。你的任务是评估 Agent 生成的 SQL 是否能够正确执行并回答用户问题。
 
 **输入上下文：**
