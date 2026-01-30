@@ -1,0 +1,7 @@
+.idea/
+__pycache__/
+*.env
+docs
+.env
+deploy/
+data
