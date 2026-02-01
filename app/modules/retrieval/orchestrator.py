@@ -1,189 +1,144 @@
-from __future__ import annotations
 import asyncio
-import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Dict, Any, List, Optional
 
 from app.core.logger import logger
-from app.modules.retrieval.schema_retriever import fetch_table_metadata
 
-from app.modules.retrieval.schema_retriever import SchemaRetriever
-from app.modules.retrieval.knowledge_retriever import KnowledgeRetriever
+# 引入我们更新后的 Retriever
+from app.modules.retrieval.schema.retriever import SchemaRetriever
+from app.modules.retrieval.knowledge.retriever import KnowledgeRetriever
+
+# 🔥 引入 V3 图服务 (单例)
+from app.modules.retrieval.graph.service import graph_service
 
 
 class RetrievalOrchestrator:
     """
-    双塔检索编排层（总调度器）
-
-    职责：
-    1) 接收 Router 的战术指令（needs_schema/needs_knowledge + schema_query/knowledge_keywords）
-    2) 并行执行 SchemaRetriever 与 KnowledgeRetriever
-    3) 融合 + Rescue（knowledge 强制 required_tables 时补齐 schema）
-    4) 输出 schema_context / knowledge_context + 原始结构化结果
+    RAG 编排层：Schema (左塔) + Knowledge (右塔) + Graph (中塔/连接层)
     """
 
     def __init__(self):
-        self._executor = ThreadPoolExecutor(max_workers=10)
-        self.schema = SchemaRetriever()
-        self.knowledge = KnowledgeRetriever(executor=self._executor)
+        # 初始化双塔检索器
+        self.schema_retriever = SchemaRetriever()
+        # knowledge_retriever 内部会有线程池处理 Milvus IO
+        self.knowledge_retriever = KnowledgeRetriever()
 
-    async def retrieve_all(
-        self,
-        *,
-        schema_query: str,
-        knowledge_keywords: Optional[List[str]] = None,
-        knowledge_query: Optional[str] = None,   # 通常就是原 question
-        needs_schema: bool = True,
-        needs_knowledge: bool = False,
-        schema_top_k: int = 5,
-        knowledge_each_top_k: int = 6,
-    ) -> Dict[str, Any]:
-        start_time = time.perf_counter()
+    async def retrieve_context(self, query: str, db_id: str) -> str:
+        """
+        全流程检索入口，返回组装好的 Prompt Context 字符串。
 
-        schema_q = (schema_query or "").strip()
-        know_q = (knowledge_query or "").strip()
-        kws = (knowledge_keywords or [])[:5]
+        Args:
+            query: 用户的自然语言问题 (e.g. "计算加州学校的平均分")
+            db_id: 目标数据库 ID (e.g. "california_schools")
 
-        logger.info(
-            f"🚀 [Retrieve] Start | schema={needs_schema} know={needs_knowledge} "
-            f"| schema_q={schema_q[:60]}... | kws={kws}",
+        Returns:
+            str: 包含 Schema、Join Paths 和 Business Rules 的格式化文本
+        """
+        if not db_id:
+            logger.warning("⚠️ [Orchestrator] Missing db_id! Retrieval might be inaccurate (cross-db noise).")
+
+        # ==========================================
+        # 1. 并行检索 Schema 和 Knowledge
+        # ==========================================
+        # 针对 BIRD 数据集，Top-K 稍微放宽一点，依赖 LLM 筛选
+        schema_k = 15
+        knowledge_k = 5
+
+        # 使用 asyncio.gather 并发执行 IO 密集型任务
+        # 注意：这里的 retrieve 方法必须支持 db_id 参数
+        schema_task = self.schema_retriever.retrieve(query, db_id, top_k=schema_k)
+
+        # 知识检索主要靠 Query 匹配规则，关键词设为 None 让内部处理
+        knowledge_task = self.knowledge_retriever.search_knowledge(
+            knowledge_keywords=None,
+            knowledge_query=query,
+            db_id=db_id,
+            each_top_k=knowledge_k
         )
 
-        tasks: Dict[str, Any] = {}
+        results = await asyncio.gather(schema_task, knowledge_task)
 
-        # 并行启动
-        if needs_schema:
-            tasks["schema"] = asyncio.create_task(self.schema.search_tables(schema_q, top_k_final=schema_top_k))
+        schema_tables: List[Dict] = results[0]
+        rules: List[str] = results[1]
 
-        if needs_knowledge:
-            tasks["knowledge"] = asyncio.create_task(
-                self.knowledge.search_knowledge(
-                    knowledge_keywords=kws,
-                    knowledge_query=know_q,
-                    each_top_k=knowledge_each_top_k,
-                )
-            )
+        # ==========================================
+        # 2. 图搜索：自动补全 JOIN 路径
+        # ==========================================
+        # 提取检索到的表名
+        found_table_names = [t.get('table_name') for t in schema_tables if t.get('table_name')]
 
-        if not tasks:
-            return self._empty_result()
-
-        results_list = await asyncio.gather(*tasks.values(), return_exceptions=True)
-
-        schema_results: List[Dict[str, Any]] = []
-        knowledge_hits: List[Dict[str, Any]] = []
-
-        for key, res in zip(list(tasks.keys()), results_list):
-            if isinstance(res, Exception):
-                logger.error(f"[Retrieve] task {key} failed: {res}")
-                continue
-            if key == "schema":
-                schema_results = res or []
-            elif key == "knowledge":
-                knowledge_hits = res or []
-
-        # 融合补齐：保留你原来的 rescue 思路
-        if needs_schema and needs_knowledge and knowledge_hits:
-            schema_results = await self._fuse_and_rescue(schema_results, knowledge_hits)
-
-        formatted = self._format_to_string(schema_results, knowledge_hits)
-
-        total_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(
-            f"✅ [Retrieve] Done {total_ms:.0f}ms | Schema:{len(schema_results)} | Know:{len(knowledge_hits)}"
-        )
-
-        return {
-            "schema_context": formatted["schema"],
-            "knowledge_context": formatted["knowledge"],
-            "candidate_tables": schema_results,
-            "raw_knowledge": knowledge_hits,
-        }
-
-    async def _fuse_and_rescue(self, schema_results: List[Dict], knowledge_hits: List[Dict]) -> List[Dict]:
-        """
-        融合逻辑：检查 Knowledge 中是否有 required_tables，如果有且 Schema 没搜到，强制补齐。
-        """
-        existing_tables = {item.get("table_name") or item.get("logical_table") for item in schema_results}
-        existing_tables = {t for t in existing_tables if t}
-
-        forced_tables = set()
-        for hit in knowledge_hits:
-            reqs = hit.get("required_tables", []) if isinstance(hit, dict) else []
-            for t in (reqs or []):
-                if t:
-                    forced_tables.add(t)
-
-        missing_tables = [t for t in forced_tables if t not in existing_tables]
-
-        if missing_tables:
-            logger.info(f"🛟 [Rescue] Knowledge 强制补回缺失表: {missing_tables}")
+        join_paths = []
+        # 只有找到两张及以上的表，才需要计算 Join 路径
+        if db_id and len(found_table_names) >= 2:
             try:
-                supplementary_schema = await fetch_table_metadata(missing_tables)
-                if supplementary_schema:
-                    schema_results.extend(supplementary_schema)
+                # 🔥 调用 V3 图服务，利用 Steiner Tree 算法寻找最佳路径
+                join_paths = graph_service.search_join_path(db_id, found_table_names)
+
+                if join_paths:
+                    logger.info(f"🕸️ [Graph] Found {len(join_paths)} join paths for {found_table_names}")
+                else:
+                    logger.debug(f"🕸️ [Graph] No join path found (Tables might be isolated).")
             except Exception as e:
-                logger.error(f"❌ [Rescue Failed] 补齐表失败: {e}")
+                logger.error(f"❌ [Graph] Path search failed: {e}")
 
-        return schema_results
+        # ==========================================
+        # 3. 组装 Context (Rich Formatting)
+        # ==========================================
+        context_parts = []
 
-    def _format_to_string(self, schema_list: List[Dict], know_list: List[Dict]) -> Dict[str, str]:
-        # =======================
-        # Schema
-        # =======================
-        schema_strs: List[str] = []
+        # --- Part A: Database Schema ---
+        if schema_tables:
+            context_parts.append("【Database Schema】")
+            for t in schema_tables:
+                table_name = t.get('table_name', 'Unknown')
+                context_parts.append(f"Table: {table_name}")
 
-        for item in schema_list or []:
-            # 优先 DDL，其次 text，最后 Table:xxx
-            content = item.get("ddl") or item.get("text")
+                for c in t.get('columns', []):
+                    # 格式: - col_name (TYPE) [PK,FK]: comment (Samples: val1, val2)
+                    c_name = c.get('name', 'unknown')
+                    c_type = c.get('type', 'UNKNOWN')
+                    c_str = f"  - {c_name} ({c_type})"
 
-            if not content or not str(content).strip():
-                tb = item.get("table_name") or item.get("logical_table") or item.get("full_name")
-                content = f"Table: {tb}" if tb else ""
+                    # 加 Key 标记 (对 LLM 理解表结构至关重要)
+                    flags = []
+                    if c.get('is_pk'): flags.append("PK")
+                    if c.get('is_fk'): flags.append("FK")
+                    if flags:
+                        c_str += f" [{','.join(flags)}]"
 
-            content = str(content).strip()
-            if content:
-                schema_strs.append(content)
+                    # 加 Comment
+                    comment = c.get('comment') or c.get('doc_text')  # 兼容不同字段名
+                    # 如果 comment 太长或者是生成的 doc_text，可能需要精简，这里暂且不放，避免干扰
 
-        schema_ctx = "\n\n".join(schema_strs).strip()
-        if not schema_ctx:
-            schema_ctx = "(无相关表结构)"
+                    # 加 Samples (BIRD 高分秘籍：让 LLM 看到真实数据格式)
+                    samples = c.get('samples', [])
+                    if samples:
+                        # 截断每个样本的长度，防止超长字符串
+                        safe_samples = [str(s)[:50] for s in samples[:3]]
+                        c_str += f" (Samples: {', '.join(safe_samples)})"
 
-        # =======================
-        # Knowledge
-        # =======================
-        know_strs: List[str] = []
-        for item in know_list or []:
-            if not isinstance(item, dict):
-                continue
-            term = item.get("term")
-            defn = item.get("definition")
-            if term and defn:
-                line = f"- **{term}**: {defn}"
+                    context_parts.append(c_str)
+            context_parts.append("")  # 空行分隔
 
-                syns = item.get("synonyms")
-                if syns:
-                    line += f" (同义词: {', '.join(syns)})"
+        # --- Part B: Suggested Joins (From Graph) ---
+        if join_paths:
+            context_parts.append("【Suggested Relationship Paths】")
+            context_parts.append("Use these join conditions to connect tables correctly:")
+            for p in join_paths:
+                context_parts.append(f"- {p}")
+            context_parts.append("")
 
-                reqs = item.get("required_tables")
-                if reqs:
-                    line += f" [关联表: {', '.join(reqs)}]"
+        # --- Part C: Business Rules (From Knowledge) ---
+        if rules:
+            context_parts.append("【Business Rules & Evidence】")
+            context_parts.append("Follow these rules to interpret the data:")
+            for r in rules:
+                context_parts.append(f"- {r}")
+            context_parts.append("")
 
-                know_strs.append(line)
+        final_context = "\n".join(context_parts)
 
-        know_ctx = "\n".join(know_strs).strip()
-        if not know_ctx:
-            know_ctx = "(无相关业务知识)"
+        # 记录日志方便调试
+        logger.info(
+            f"✅ [Orchestrate] Built context with {len(schema_tables)} tables, {len(join_paths)} paths, {len(rules)} rules.")
 
-        return {"schema": schema_ctx, "knowledge": know_ctx}
-
-    def _empty_result(self) -> Dict[str, Any]:
-        return {
-            "schema_context": "",
-            "knowledge_context": "",
-            "candidate_tables": [],
-            "raw_knowledge": [],
-        }
-
-
-# 单例导出（graph 用这个）
-retriever = RetrievalOrchestrator()
+        return final_context

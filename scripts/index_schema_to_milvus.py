@@ -165,7 +165,7 @@ def main():
 
     # 刷盘并加载到内存，准备查询
     col.flush()
-    # col.load() # 暂时不 Load，留给 knowledge_retriever.py 懒加载
+    # col.load() # 暂时不 Load，留给 retriever.py 懒加载
 
     logger.info(f"🎉 All Done! Total {col.num_entities} entities indexed in '{COLLECTION_NAME}'.")
 

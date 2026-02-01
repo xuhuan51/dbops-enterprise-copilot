@@ -20,8 +20,8 @@ except ImportError:
 # 3. 引入 RAG 模块 (路径已修正)
 HAS_RETRIEVE = False
 try:
-    # 刚才我们在 schema_retriever.py 里确认过这些函数
-    from app.modules.retrieval.schema_retriever import (
+    # 刚才我们在 retriever.py 里确认过这些函数
+    from app.modules.retrieval.schema.retriever import (
         get_embed_model,
         ensure_milvus_connection
     )

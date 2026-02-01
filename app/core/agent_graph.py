@@ -12,7 +12,6 @@ from app.core.logger import logger
 from app.core.prompts import (
     GEN_SQL_PROMPT,
     ERROR_CLASSIFY_PROMPT,
-    REFLECTION_PROMPT,
     ONE_PASS_ROUTER_PROMPT,
     CLARIFY_PROMPT,
 )
@@ -22,7 +21,6 @@ from app.core.state import (
     RouterOutput,
     SQLOutput,
     ErrorOutput,
-    ReflectionOutput,
 )
 from app.core.llm import (
     get_router_llm,
@@ -32,7 +30,7 @@ from app.core.llm import (
 )
 
 from app.modules.retrieval.orchestrator import retriever
-from app.modules.retrieval.schema_retriever import fetch_table_metadata
+from app.modules.retrieval.schema.retriever import fetch_table_metadata
 from app.modules.sql.executor import execute_sql_explain, get_tables_columns, search_tables_by_column
 from app.modules.sql.guardrail import validate_and_rewrite, validate_schema_columns
 
