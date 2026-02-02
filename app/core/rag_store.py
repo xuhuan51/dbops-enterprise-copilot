@@ -1,71 +1,63 @@
 import json
-from sentence_transformers import SentenceTransformer
 from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
 
 from app.core.config import settings
 from app.core.logger import logger
-
-# ==========================================
-# 1. 动态加载 BGE-M3 (保持不变)
-# ==========================================
-encoder = SentenceTransformer(settings.EMBED_MODEL)
-_test_vec = encoder.encode("check dimension")
-DIMENSION = len(_test_vec)
-logger.info(f"📏 Model loaded: {settings.EMBED_MODEL}, Dimension: {DIMENSION}")
-
+from app.core.embedding import embedder  # ✅ 1. 引入 Embedding 单例
 
 class MilvusDAO:
     def __init__(self):
         self._connect_milvus()
+
+        # ✅ 2. 动态获取维度 (这会触发模型懒加载)
+        # BGE-M3 默认为 1024，BGE-Large 为 1024，Base 为 768
+        # 这样无论你换什么模型，这里都会自动适配，不用手动改代码
+        self.dimension = embedder.dimension
+        logger.info(f"📏 Milvus Schema Dimension initialized to: {self.dimension}")
+
         self.schema_col = self._init_schema_collection()
         self.knowledge_col = self._init_knowledge_collection()
 
     def _connect_milvus(self):
         try:
-            # 生产环境建议从 settings 读取 host/port
-            connections.connect(alias="default", host="localhost", port="19530")
+            # 建议使用 settings 里的配置，而不是写死 localhost
+            connections.connect(
+                alias="default",
+                host=settings.MILVUS_HOST,
+                port=settings.MILVUS_PORT
+            )
         except Exception as e:
             logger.error(f"❌ Milvus Connection Failed: {e}")
 
     # ==========================================
-    # 2. Schema 集合 (适配 build_bird_catalog)
+    # 2. Schema 集合
     # ==========================================
     def _init_schema_collection(self):
         name = "rag_schema_bird"
 
         # 定义字段结构
         fields = [
-            # 唯一主键
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            # 核心向量
-            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=DIMENSION),
+            # ✅ 3. 使用 self.dimension
+            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=self.dimension),
 
-            # --- 过滤字段 (用于 expr 过滤) ---
             FieldSchema(name="db_id", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="table_name", dtype=DataType.VARCHAR, max_length=128),
             FieldSchema(name="column_name", dtype=DataType.VARCHAR, max_length=128),
-            FieldSchema(name="is_pk", dtype=DataType.BOOL),  # 新增：方便只搜主键
-            FieldSchema(name="is_fk", dtype=DataType.BOOL),  # 新增：方便只搜外键
-
-            # --- 内容字段 ---
-            # 你的 doc_text 很长，包含了 dataset | table | column | samples 等
+            FieldSchema(name="is_pk", dtype=DataType.BOOL),
+            FieldSchema(name="is_fk", dtype=DataType.BOOL),
             FieldSchema(name="doc_text", dtype=DataType.VARCHAR, max_length=8192),
-
-            # 原始 JSON (存 num_profile, samples 列表, fk_to 详情等)
             FieldSchema(name="metadata_json", dtype=DataType.VARCHAR, max_length=65535)
         ]
 
         schema = CollectionSchema(fields, description="BIRD Database Schema Knowledge")
 
-        # 初始化或加载
         if utility.has_collection(name):
             col = Collection(name)
-            # 如果schema变了，这里可能需要 drop 再 create，开发阶段手动 drop 即可
             col.load()
             return col
 
         col = Collection(name, schema)
-        # HNSW 索引：平衡速度和精度
         col.create_index("vector", {
             "metric_type": "COSINE",
             "index_type": "HNSW",
@@ -75,22 +67,18 @@ class MilvusDAO:
         return col
 
     # ==========================================
-    # 3. Knowledge 集合 (适配 build_business_rule_base)
+    # 3. Knowledge 集合
     # ==========================================
     def _init_knowledge_collection(self):
         name = "rag_knowledge_bird"
 
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=DIMENSION),
+            # ✅ 3. 使用 self.dimension
+            FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=self.dimension),
 
-            # --- 过滤字段 ---
             FieldSchema(name="db_id", dtype=DataType.VARCHAR, max_length=128),
-
-            # --- 内容字段 ---
-            # 对应你的 "doc_text": f"Business Rule for {db_id}: {rule}"
             FieldSchema(name="doc_text", dtype=DataType.VARCHAR, max_length=4000),
-            # 对应你的 "rule_text" (纯净规则)
             FieldSchema(name="rule_text", dtype=DataType.VARCHAR, max_length=4000)
         ]
 
@@ -111,15 +99,14 @@ class MilvusDAO:
         return col
 
     # ==========================================
-    # 4. 通用检索方法 (增强版)
+    # 4. 通用检索方法
     # ==========================================
     def search_vectors(self, collection_name: str, query_text: str, top_k: int = 5, db_id: str = None):
         """
-        :param db_id: 如果传入，则只在该数据库范围内搜索 (Partition/Filter)
+        :param db_id: 数据库 ID 过滤
         """
         if collection_name == "schema":
             col = self.schema_col
-            # 默认返回字段
             output_fields = ["table_name", "column_name", "doc_text", "metadata_json", "is_pk"]
         elif collection_name == "knowledge":
             col = self.knowledge_col
@@ -129,13 +116,15 @@ class MilvusDAO:
 
         # 1. Embedding
         try:
-            vec = encoder.encode([query_text], normalize_embeddings=True)[0].tolist()
+            # ✅ 4. 使用 embedder 单例进行编码
+            # 注意：embedder.encode 返回的是 numpy array，需要转 list 才能给 Milvus
+            vec_result = embedder.encode([query_text], normalize_embeddings=True)
+            vec = vec_result[0].tolist()
         except Exception as e:
             logger.error(f"Embedding error: {e}")
             return []
 
-        # 2. 构建过滤表达式 (Expr)
-        # BIRD 是多库数据集，一定要防止串库！
+        # 2. 过滤表达式
         expr = None
         if db_id:
             expr = f"db_id == '{db_id}'"
@@ -147,14 +136,13 @@ class MilvusDAO:
                 anns_field="vector",
                 param={"metric_type": "COSINE", "params": {"nprobe": 10}},
                 limit=top_k,
-                expr=expr,  # <--- 关键：加上了 filtering
+                expr=expr,
                 output_fields=output_fields
             )
             return res
         except Exception as e:
             logger.error(f"Milvus search error: {e}")
             return []
-
 
 # 实例化单例
 rag_store = MilvusDAO()

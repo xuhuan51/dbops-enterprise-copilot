@@ -90,86 +90,90 @@ TABLE_CARD_GOVERNANCE_PROMPT = """
 
 
 ONE_PASS_ROUTER_PROMPT = """
-你是数据智能系统的核心中枢。你的任务是根据【对话历史】和【当前问题】，输出精准的 JSON 决策包。
+你是数据智能系统中的【决策分流引擎】。
+你的任务是：根据【对话历史】和【当前问题】，输出一个**严格的 JSON 决策对象**。
 
-### 核心原则
-1. **JSON Only**: 严禁输出任何 Markdown、代码块或解释性文字。
-2. **No SQL**: 严禁生成 SQL 语句。
-3. **Safety**: 如果意图不清，宁可反问 (AMBIGUOUS)，不要瞎猜。
+========================
+【硬性输出约束】
+1. **JSON Only**: 严禁输出 Markdown (```json)，严禁输出解释性文字。
+2. **Format**: 必须以 "{{" 开头，以 "}}" 结尾。
+3. **Safety**: 不确定的意图（如缺少对象/时间），必须标记 needs_clarify=true。
 
-================================================
-### 1) 意图分类 (intent)
-从以下 5 类中选择唯一且最匹配的一项：
+========================
+【决策字段定义】
 
-- **DATA_QUERY**: 用户想查具体的“业务数据/日志”。
-  - 特征：需要聚合(sum/count)、筛选、排序、查看明细、统计报表。
-  - 例子："上周销量"、"查错单日志"、"统计北京用户数"。
+1. **intent** (枚举):
+   - "DATA_QUERY": 查数据 (e.g. "销量", "订单列表", "统计用户")
+   - "METADATA_QUERY": 查定义/结构 (e.g. "表结构", "GMV口径", "字段含义")
+   - "OPS_DIAGNOSIS": 运维/报错 (e.g. "查询慢", "报错500", "配置")
+   - "CHAT": 闲聊 (e.g. "你好", "谢谢")
+   - "AMBIGUOUS": 意图不清 (e.g. "怎么算?", "那个数据不对")
 
-- **METADATA_QUERY**: 用户想查“定义/结构/说明书”。
-  - 特征：不涉及具体行数据，只关心表结构、字段含义、血缘关系。
-  - 例子："t_order表是谁建的"、"status字段枚举值"、"GMV的口径是什么"。
+2. **needs_knowledge** (Boolean):
+   - **True**: 涉及业务术语(大R/GMV/ROI)、枚举状态(已支付/异常)、运维报错、表结构查询。
+   - **False**: 简单的明细查询或通用统计。
 
-- **OPS_DIAGNOSIS**: 运维/技术/故障排查。
-  - 特征：报错、性能慢、配置参数、原理咨询。
-  - 例子："连接超时怎么办"、"API为什么慢"、"数据库CPU高"。
+3. **query_complexity** (Enum):
+   - "simple": 单表 / 简单过滤 / TopN (预算: 20)
+   - "medium": 多条件 / 简单聚合 / 排序 (预算: 40)
+   - "hard": 多表 JOIN / 复杂分组 / 窗口函数 / 多指标 (预算: 60)
 
-- **CHAT**: 闲聊/问候。
-- **AMBIGUOUS**: 信息严重缺失，无法执行。
-  - 特征：缺主语、缺时间、缺对象，且无法从历史推断。
-- intent 必须严格使用枚举值，不得输出小写或中文。
+========================
+【Few-Shot 参考示例】(学习这些 Case 的逻辑)
 
-================================================
-### 2) 资源开关 (Switches)
-
-- **needs_schema** (搜表结构): 
-  - DATA_QUERY / METADATA_QUERY -> True
-  - 其他 -> False
-
-- **needs_knowledge** (搜文档/黑话):
-  - OPS_DIAGNOSIS -> True
-  - METADATA_QUERY -> True (查定义)
-  - DATA_QUERY -> 仅当包含"黑话/缩写/复杂指标"时 True (如: 大R, ARPU)
-  - 简单物理查询 -> False
-
-- **needs_clarify** (需反问):
-  - AMBIGUOUS -> True
-  - 关键要素缺失 -> True
-
-================================================
-### 3) 搜索增强 (Extraction)
-
-- **schema_query**: (needs_schema=True 时必填)
-  - 格式: "问题核心主干 + 关键词1 关键词2 ..."
-  - 规则: 去除无意义口语(如"帮我查"), 保留业务语义。
-
-- **knowledge_keywords**: (needs_knowledge=True 时必填)
-  - 提取 2-5 个关键术语 (如 ["大R", "转化率", "Error 1064"])。
-
-- **clarify_questions**: (needs_clarify=True 时必填)
-  - 1-3 个简短的澄清追问。
-
-================================================
-### 输入信息
-【对话历史】:
-{history}
-
-【当前问题】:
-{question}
-
-================================================
-输出示例 (严格 JSON):
+**Case 1: 简单查询**
+Input: "帮我查一下北京地区昨天的订单列表"
+Output:
 {{
-  "reason": "用户想查订单数据，'大R'是术语需查知识库，同时也需要查表结构。",
   "intent": "DATA_QUERY",
+  "reason": "用户查询具体订单明细，有明确时间(昨天)和地点(北京)，逻辑简单。",
+  "needs_schema": true,
+  "needs_knowledge": false,
+  "needs_clarify": false,
+  "query_complexity": "simple",
+  "pruning_budget_cols": 20,
+  "clarify_questions": []
+}}
+
+**Case 2: 复杂业务统计**
+Input: "统计上个月大R用户的流失率，按城市排名"
+Output:
+{{
+  "intent": "DATA_QUERY",
+  "reason": "涉及聚合统计和排名，'大R'和'流失率'是业务术语，需查知识库。",
   "needs_schema": true,
   "needs_knowledge": true,
   "needs_clarify": false,
-  "schema_query": "统计大R订单金额 大R 订单 order amount sum pay",
-  "knowledge_keywords": ["大R", "订单金额口径"],
+  "query_complexity": "hard",
+  "pruning_budget_cols": 60,
   "clarify_questions": []
 }}
-开始输出:
+
+**Case 3: 意图不明**
+Input: "为什么不对？"
+Output:
+{{
+  "intent": "AMBIGUOUS",
+  "reason": "缺少上下文，不知道指代什么不对，需要追问。",
+  "needs_schema": false,
+  "needs_knowledge": false,
+  "needs_clarify": true,
+  "query_complexity": "simple",
+  "pruning_budget_cols": 20,
+  "clarify_questions": ["请问具体是哪个数据或报表不对？", "能提供一下相关的查询ID吗？"]
+}}
+
+========================
+【当前任务】
+对话历史:
+{history}
+
+当前问题:
+{question}
+
+开始输出 JSON:
 """
+
 
 
 
@@ -397,7 +401,6 @@ DATA_SUMMARY_PROMPT = """
 请生成回答：
 """
 
-# app/core/prompts.py
 
 CLARIFY_PROMPT = """
 你是一个专业且体贴的数据智能助手。
@@ -420,4 +423,74 @@ CLARIFY_PROMPT = """
 - "您想查询哪张表的字段定义？是【订单表】还是【用户表】？"
 
 开始生成回复：
+"""
+
+CAPABILITY_EXPAND_PROMPT = """
+你是一个【查询语义理解与检索桥接模块】。
+你的任务是将用户的自然语言问题（可能是中文或英文）转换为**结构化的语义意图**和**标准化的英文检索关键词**。
+
+### 核心原则
+1. **语义抽象**: 理解用户“想要什么指标”和“有什么限制条件”，而不是去猜数据库表名。
+2. **检索增强**: 数据库列名和注释是**英文**的。你必须将提取的核心概念翻译为**英文关键词列表**，供搜索引擎使用。
+3. **严禁幻觉**: 绝对不要编造具体的 SQL、Table Name（如 t_users）或 Field Name（如 user_id）。
+
+========================
+任务一：抽取能力桶 (Capabilities)
+========================
+从以下列表中选择（可多选）：
+- LOOKUP        ：查询明细/列表 (list, show, what is)
+- FILTER        ：存在筛选条件 (where ...)
+- COMPARISON    ：比较大小 (>, <, =, vs)
+- AGGREGATION   ：聚合统计 (count, sum, avg)
+- SORT          ：排序 (highest, lowest, top)
+- TOPK_LIMIT    ：前N项 (top 3, bottom 5)
+- GROUPING      ：分组统计 (per, each, by)
+- JOIN          ：涉及多实体关联
+
+========================
+任务二：提取语义线索 (Semantic Hints)
+========================
+提取自然语言层面的含义（保持原语言或翻译为英文均可，重点是描述准确）：
+- target_hint : 用户关注的主体对象 (如: school, student)
+- metric_hint : 用户想要查的具体数值/属性 (如: zip code, free lunch rate)
+- filter_hints: 具体的筛选条件值 (如: Alameda County, K-12, Charter)
+- group_hint  : 分组依据 (如: per school)
+- time_hint   : 时间范围 (如: 2023)
+
+========================
+任务三：生成检索关键词 (Search Keywords) - 关键！
+========================
+为了在数据库 Schema (表名/列名/注释) 中检索，请输出一个**英文关键词列表**：
+1. **翻译**: 将所有中文概念转为英文 (e.g., "免费午餐" -> "free", "lunch", "meal")。
+2. **分解**: 将复合词拆解为原子词 (e.g., "school_id" -> "school", "id")。
+3. **值保留**: 保留核心的专有名词/过滤值 (e.g., "Fresno", "Alameda")。
+4. **去噪**: 去除停用词 (the, is, of, in, all, list, please)。
+
+示例：
+User: "List the zip code of charter schools in Fresno"
+Keywords: ["zip", "code", "charter", "school", "fresno", "county"]
+
+User: "最高免费午餐比例的 K-12 学校"
+Keywords: ["highest", "free", "lunch", "meal", "rate", "eligible", "k_12", "school"]
+
+========================
+输出格式 (Strict JSON)
+========================
+{
+  "capabilities": [],
+  "semantic_hints": {
+    "target_hint": null,
+    "metric_hint": null,
+    "filter_hints": [],
+    "group_hint": null,
+    "time_hint": null
+  },
+  "search_keywords": [] 
+}
+
+========================
+用户问题：
+{question}
+
+输出 JSON：
 """

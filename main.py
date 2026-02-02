@@ -4,32 +4,22 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 import uvicorn
 
-# 1. 引入路由
 from app.api.v1.agent_query import router as agent_router
 from app.api.v1.query import router as raw_sql_router
 from app.api.v1.analyze import router as analyze_router
 
-# 2. 引入数据库基础设施 (用于优雅关闭)
-# 假设你的 infrastructure.db.mysql 里有一个 close_pool 或类似的清理函数
-# 如果没有，暂时注释掉 shutdown 里的清理逻辑也没关系
+# 1. 引入 RAG 相关的单例 (Core 层)
 try:
-    from app.infrastructure.db.mysql import close_pool
-except ImportError:
-    close_pool = None
-
-# 3. 引入 RAG 模块 (路径已修正)
-HAS_RETRIEVE = False
-try:
-    # 刚才我们在 retriever.py 里确认过这些函数
-    from app.modules.retrieval.schema.retriever import (
-        get_embed_model,
-        ensure_milvus_connection
-    )
-    # 这个 router 应该还在 api 层
+    from app.core.rag_store import rag_store
+    from app.core.embedding import embedder  # ✅ 新增
+    from app.core.reranker import reranker
+    # 假设你的 retrieve_router 在这里
     from app.api.v1.retrieve_tables import router as retrieve_router
+
     HAS_RETRIEVE = True
 except ImportError as e:
     print(f"⚠️ RAG Import Warning: {e}")
+    HAS_RETRIEVE = False
 
 
 @asynccontextmanager
@@ -37,44 +27,34 @@ async def lifespan(app: FastAPI):
     print("\n🔥 [Startup] System is warming up...")
     t0 = time.perf_counter()
 
-    # ===========================
-    # 1. 数据库连接池无需在此初始化
-    # ===========================
-    # 新架构下，Executor 会在第一次调用时通过 infrastructure 自动获取连接池。
-    # 我们这里可以什么都不做，或者简单打印一下。
-    print("   🔌 Database: Lazy connection mode (Managed by Infrastructure).")
-
-    # ===========================
-    # 2. 初始化 RAG 资源
-    # ===========================
     if HAS_RETRIEVE:
         try:
-            print("   🛠️ Checking Milvus connection...")
-            if ensure_milvus_connection():
-                print("   ✅ Milvus connected.")
-            else:
-                print("   ⚠️ Milvus connection failed (Soft fail).")
+            print("   🛠️  Initializing Milvus connection...")
+            # 这一步会触发 Milvus 连接
+            # rag_store 是单例，只要访问它，它内部的 __init__ 就会跑
+            # 而 rag_store.__init__ 现在会调用 embedder.dimension，进而触发模型加载
+            _ = rag_store.schema_col
+            print("   ✅ Milvus connected & Schema loaded.")
 
-            print("   🧠 Loading Embedding model...")
-            # 预加载模型，避免第一次请求卡顿
-            get_embed_model()
+            # 如果你想显式预热 Embedding (虽然上面一行可能已经触发了)
+            print("   🧠 Pre-loading Embedding model...")
+            embedder.load_model()
+
+            # 显式预热 Reranker
+            print("   ⚖️  Pre-loading Rerank model...")
+            reranker._load_model()  # 触发加载
+
         except Exception as e:
-            print(f"   ⚠️ RAG Warmup skipped: {e}")
+            print(f"   ⚠️ RAG Warmup skipped or failed: {e}")
     else:
-        print("   ⏩ RAG module disabled or missing.")
+        print("   ⏩ RAG module disabled.")
 
     elapsed = time.perf_counter() - t0
     print(f"✅ [Startup] Ready! Took {elapsed:.2f}s\n")
 
     yield
 
-    # ===========================
-    # 3. 关闭资源
-    # ===========================
     print("🛑 [Shutdown] Cleaning up...")
-    if close_pool:
-        await close_pool()
-        print("   ✅ Database pool closed.")
 
 
 app = FastAPI(title="dbops-enterprise-copilot", lifespan=lifespan)

@@ -77,40 +77,59 @@ def _allowed_tables(candidate_tables: List[Dict[str, Any]]) -> Set[str]:
 # =========================
 # Nodes
 # =========================
-
 async def router_node(state: AgentState):
     trace_id = state.get("trace_id", "N/A")
     question = state.get("question", "")
     history: List[BaseMessage] = state.get("history", [])
 
-    print(f"\n{'=' * 30} [🚦 透视: ROUTER] {'=' * 30}")
+    print(f"\n{'=' * 30} [🚦 透视: ROUTER (指挥与预算)] {'=' * 30}")
     print(f"❓ 问题: {question}")
 
     history_text = _format_history(history)
 
     try:
+        # 调用 LLM 进行结构化输出
         prompt = ONE_PASS_ROUTER_PROMPT.format(history=history_text, question=question)
         router_output: RouterOutput = await router_llm.with_structured_output(RouterOutput).ainvoke(prompt)
+
     except Exception as e:
-        logger.error(f"[Router] failed: {e}", extra={"trace_id": trace_id})
+        logger.error(f"[Router] LLM failed: {e}", extra={"trace_id": trace_id})
+        # 🛡️ Fallback 兜底策略：
+        # 如果 Router 挂了，默认假设是一个“困难的查数据任务”，拉满预算，防止后续流程断掉
         router_output = RouterOutput(
-            reason="Fallback router error",
             intent=IntentType.DATA_QUERY,
+            reason="Router LLM Error (Fallback)",
             needs_schema=True,
-            needs_knowledge=True,
+            needs_knowledge=True,  # 默认开启
             needs_clarify=False,
-            schema_query=question,
-            knowledge_keywords=[],
-            clarify_questions=[],
+            query_complexity="hard",  # 默认困难
+            pruning_budget_cols=60,  # 默认满预算
+            clarify_questions=[]
         )
 
-    print(f"✅ 意图: {router_output.intent}")
-    print(f"📋 需要Schema: {router_output.needs_schema} | 需要知识库: {router_output.needs_knowledge}")
+    # =======================================================
+    # 🔥 硬规则干预 (Hard Rules) - 治愈 LLM 的“过度自信”
+    # =======================================================
+
+    if router_output.intent == IntentType.DATA_QUERY:
+        # 规则 1: 只要查数据，强制开启知识库检索（宁可搜空，不可不搜）
+        if not router_output.needs_knowledge:
+            print(f"🛡️ [Router] 强制开启 needs_knowledge (保底策略)")
+            router_output.needs_knowledge = True
+
+        # 规则 2: 如果是 Hard 模式，强制拉满预算（防止 LLM 抠门）
+        if router_output.query_complexity == "hard" and router_output.pruning_budget_cols < 60:
+            router_output.pruning_budget_cols = 60
+
+    print(f"✅ 意图: {router_output.intent} ({router_output.query_complexity})")
+    print(f"💰 预算: Top-{router_output.pruning_budget_cols} Cols")
+    print(f"📋 开关: Schema={router_output.needs_schema} | Knowledge={router_output.needs_knowledge}")
     print(f"{'=' * 80}\n")
 
     return {
         "intent": router_output.intent,
         "intent_data": router_output,
+        # 注意：这里不需要返回 keywords，下一步 Expand Node 会负责生成
     }
 
 
@@ -140,6 +159,8 @@ async def clarify_node(state: AgentState):
         "generated_sql": "",
         "final_result": None,
     }
+
+
 
 
 async def retrieve_node(state: AgentState):

@@ -1,24 +1,12 @@
-from typing import List, Dict, Any, TypedDict, Literal, Optional
+from typing import List, Dict, Any, TypedDict, Literal, Optional, Annotated
 from enum import Enum
+import operator
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
 
 
 # ==========================================
-# 0. Execution Trace (可选：执行记录)
-# ==========================================
-
-class ExecutionStep(TypedDict):
-    node: str               # 节点名称 (e.g., "Router")
-    purpose: str            # 为什么要调用这个节点 (e.g., "分析意图并分流")
-    llm_raw_output: Any     # 大模型生成的原始数据 (JSON对象或SQL)
-    thought_process: str    # 大模型的推理过程 (Reasoning)
-    status: str             # 执行状态 (Success/Failed/Blocked)
-    timestamp: float        # 时间戳
-
-
-# ==========================================
-# 1. Router Models (唯一版本 ✅)
+# 1. 基础枚举与定义
 # ==========================================
 
 class IntentType(str, Enum):
@@ -29,77 +17,141 @@ class IntentType(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
+
+# ==========================================
+# 新增：规划线索 (Plan Hints) - 剥离排序/Limit
+# ==========================================
+class PlanHints(BaseModel):
+    limit: Optional[int] = Field(None, description="LIMIT 数量 (e.g. 3)")
+    order_direction: Optional[Literal["ASC", "DESC"]] = Field(None, description="排序方向")
+    agg_method: Optional[Literal["MAX", "MIN", "SUM", "AVG", "COUNT"]] = Field(None, description="聚合方式")
+
+# ==========================================
+# 修改：语义桶 (Semantic Buckets)
+# ==========================================
+class SemanticBuckets(BaseModel):
+    """思维链中间层：需求桶"""
+    entity: List[str] = Field(default_factory=list, description="业务对象 (表级)")
+    metric: List[str] = Field(default_factory=list, description="数值指标 (列级，不含排序词)")
+    filter: List[str] = Field(default_factory=list, description="过滤条件 (保留原短语)")
+    plan_hints: Optional[PlanHints] = Field(None, description="排序与截断信息")
+    target_hint: Optional[str] = Field(None, description="主要对象")
+    metric_hint: Optional[str] = Field(None, description="指标/字段含义")
+    filter_hints: List[str] = Field(default_factory=list, description="过滤原短语")
+    group_hint: Optional[str] = Field(None, description="分组线索")
+    time_hint: Optional[str] = Field(None, description="时间线索")
+
+
+
+# ==========================================
+# 修改：Expand 输出
+# ==========================================
+class ExpandOutput(BaseModel):
+    """Expand Node 输出"""
+    semantic_buckets: SemanticBuckets = Field(..., description="结构化拆解")
+    schema_keywords: List[str] = Field(default_factory=list, description="物理字段关键词列表") # ✅ 改为 List
+    knowledge_keywords: List[str] = Field(default_factory=list, description="严格受控的业务术语")
+
+CapabilityType = Literal[
+    "LOOKUP",
+    "FILTER",
+    "COMPARISON",
+    "TIME_RANGE",
+    "AGGREGATION",
+    "GROUPING",
+    "SORT",
+    "TOPK_LIMIT",
+    "JOIN",
+]
+
+class SemanticHints(BaseModel):
+    """
+    Option A: 只保留“人话层”的语义线索，不做 schema 推断
+    """
+    target_hint: Optional[str] = Field(None, description="主要对象（如 学校/学生/订单/用户）")
+    metric_hint: Optional[str] = Field(None, description="指标/字段含义（如 eligible free rate / zip code）")
+    filter_hints: List[str] = Field(default_factory=list, description="过滤原短语（允许包含具体值）")
+    group_hint: Optional[str] = Field(None, description="分组线索（如 by city / 每个县）")
+    time_hint: Optional[str] = Field(None, description="时间线索（如 last 30 days / 2023年）")
+
+
+class CapabilityExpandOutput(BaseModel):
+    """
+    Expand Node 新输出（Option A）
+    """
+    capabilities: List[CapabilityType] = Field(default_factory=list)
+    semantic_hints: SemanticHints = Field(default_factory=SemanticHints)
+    search_keywords: List[str] = Field(default_factory=list, description="标准化的英文检索关键词")
+
+# ==========================================
+# 3. Router 输出 (决策包)
+# ==========================================
 class RouterOutput(BaseModel):
     """
-    核心调度器的输出结构：
-    包含意图、开关、搜索词、追问建议等所有指令
+    Router 节点的输出对象，后续会被 Expand 节点填充更多细节。
     """
-    reason: str = Field(..., description="解释为什么选择该意图")
-    intent: IntentType = Field(..., description="主要意图分类")
+    # --- 1. 核心决策 (Router 负责) ---
+    intent: IntentType = Field(..., description="用户意图")
+    reason: str = Field(..., description="决策理由")
 
-    # --- 资源开关 (Switches) ---
-    needs_schema: bool = Field(..., description="是否需要检索数据库表结构(左塔)")
-    needs_knowledge: bool = Field(..., description="是否需要检索业务知识/文档(右塔)")
-    needs_clarify: bool = Field(..., description="是否需要反问用户")
+    # --- 2. 资源开关 (Router 负责) ---
+    needs_schema: bool = Field(..., description="是否查表结构")
+    needs_knowledge: bool = Field(..., description="是否查知识库")
+    needs_clarify: bool = Field(..., description="是否需要追问")
 
-    # --- 搜索增强 (Search Terms) ---
-    schema_query: Optional[str] = Field(None, description="用于左塔检索的改写语句(去噪后)")
-    knowledge_keywords: List[str] = Field(default_factory=list, description="用于右塔检索的关键词列表")
+    # --- 3. 预算控制 (Router 负责) ---
+    query_complexity: Literal["simple", "medium", "hard"] = Field(..., description="查询复杂度")
+    pruning_budget_cols: int = Field(..., description="列剪枝预算")
 
-    # --- 追问 (Clarification) ---
-    clarify_questions: List[str] = Field(default_factory=list, description="如果不清楚，生成的追问建议")
+    # --- 4. 交互追问 (Router 负责) ---
+    clarify_questions: List[str] = Field(default_factory=list)
+
+    # --- 5. 知识库专用词 (Router 负责) ---
+    # Router 可能会专门提取一些业务术语（如 "ROI", "大R"）用于查文档
+    knowledge_keywords: List[str] = Field(default_factory=list, description="业务术语/知识库关键词")
+
+    # =================================================================
+    # 🔥 下面是 Expand Node 填充的字段 (v3.0 架构)
+    # =================================================================
+
+    # [A] 语义理解：给 Generator (写SQL) 看的
+    capabilities: List[CapabilityType] = Field(default_factory=list, description="查询能力需求 (Filter, Sort, etc.)")
+    semantic_hints: SemanticHints = Field(default_factory=SemanticHints, description="自然语言层面的语义线索")
+
+    # [B] 物理检索：给 Retriever (找列) 看的
+    search_keywords: List[str] = Field(default_factory=list, description="[关键] 标准化的英文检索关键词列表")
+
+    # [C] 兼容/日志字段
+    schema_query: Optional[str] = Field(None, description="search_keywords 的字符串拼接版本，用于日志或简单检索")
 
 
 # ==========================================
-# 2. AgentState (图状态定义)
+# 4. Phase 2: Planner 结构 (CoT)
 # ==========================================
 
-class AgentState(TypedDict, total=False):
-    """
-    total=False: 允许不同节点逐步补齐字段，避免 LangGraph 过程中 KeyError。
-    如果你想更严格，可以改回 total=True + 在每个节点都填满字段。
-    """
-
-    # --- 基础字段 ---
-    trace_id: str
-    question: str
-    history: List[BaseMessage]
-
-    # --- Router ---
-    intent: IntentType
-    intent_data: Optional[RouterOutput]
-
-    # --- 召回层 (Retrieval Context) ---
-    candidate_tables: List[Dict[str, Any]]
-    rag_contexts: Dict[str, str]             # keys: schema, knowledge
-    table_columns: Dict[str, List[str]]      # 物理表列名缓存
-
-    # --- 生成层 (Generation Output) ---
-    generated_sql: str
-    sql_confidence: float
-    tables_used: List[str]
-    assumptions: List[str]
-    search_query: Optional[str]              # 兼容字段：可保留
-
-    # --- 错误处理与修复 ---
-    validation_error: Optional[str]
-    error_type: Optional[str]
-    suggested_search_keywords: List[str]
-    retry_count: int
-    reflection_count: int
-
-    # --- 反思与哨兵 ---
-    reflection_passed: Optional[bool]
-    reflection_feedback: Optional[str]
-    sentinel_blocked: Optional[bool]
-
-    # --- 结果层 ---
-    final_answer: Optional[str]
-    final_result: Any
+class SQLPlan(BaseModel):
+    """Structured Reasoning: 强制模型先做需求映射，再生成计划"""
+    thought_process: str = Field(...,
+                                 description="Step-by-step reasoning: 1.Analyze Requirements 2.Map to Schema 3.Select Join Path")
+    tables_involved: List[str] = Field(..., description="Final list of table names to use")
+    join_paths: List[str] = Field(..., description="Exact JOIN conditions from Graph Hints")
+    columns_selected: List[str] = Field(..., description="Physical columns for SELECT")
+    filter_conditions: List[str] = Field(..., description="Physical conditions for WHERE")
+    is_impossible: bool = Field(False, description="Set true if required columns are missing")
 
 
 # ==========================================
-# 3. LLM 输出结构 (Generate/Reflect/Classify)
+# 5. Phase 4: Diagnosis 结构
+# ==========================================
+
+class DiagnosisResult(BaseModel):
+    status: Literal["legit_empty", "join_issue", "filter_issue", "error"]
+    reason: str
+    suggested_fix: str
+
+
+# ==========================================
+# 6. LLM 输出结构 (Generate/Reflect/Classify)
 # ==========================================
 
 class SQLOutput(BaseModel):
@@ -115,20 +167,44 @@ class ErrorOutput(BaseModel):
     search_keywords: List[str] = Field(default_factory=list, description="用于补搜的关键词")
 
 
-class ReflectionOutput(BaseModel):
-    is_valid: bool = Field(description="true=通过, false=不通过")
+# ==========================================
+# 7. Agent State (全局状态)
+# ==========================================
 
-    severity: Literal["MUST_FAIL", "SHOULD_WARN", "PASS"] = Field(
-        default="PASS",
-        description="MUST_FAIL=必须修复; SHOULD_WARN=建议提醒但不阻断; PASS=通过"
-    )
+class AgentState(TypedDict, total=False):
+    # Base
+    trace_id: str
+    question: str
+    db_id: str
+    history: List[BaseMessage]
 
-    reason: str = Field(default="", description="简短判断理由")
+    # Router & Intent
+    intent: IntentType
+    intent_data: Optional[RouterOutput]
 
-    error_type: Literal["COLUMN_NOT_FOUND", "TABLE_NOT_FOUND", "LOGIC_ERROR", "NONE"] = Field(
-        default="NONE"
-    )
+    # Retrieval Context
+    retrieved_tables: List[str]
+    retrieved_columns: List[Any]  # 原始列信息
+    schema_str: str  # 格式化后的 Schema
+    graph_hints: List[str]  # Graph Service 算出的路径
+    business_rules: List[str]  # 知识库规则
 
-    missing_items: List[str] = Field(default_factory=list, description="Schema中找不到的表/字段")
-    suggested_search_keywords: List[str] = Field(default_factory=list, description="修复检索关键词")
-    suggested_improvements: List[str] = Field(default_factory=list, description="可选改进建议(不触发repair)")
+    # Planning
+    plan: Optional[SQLPlan]
+
+    # Generation & Execution
+    generated_sql: str
+    sql_result: Optional[List[Dict[str, Any]]]
+    error_message: Optional[str]
+
+    # Diagnosis
+    diagnosis: Optional[DiagnosisResult]
+
+    # Counters & Feedback
+    retry_count: Annotated[int, operator.add]
+    reflection_feedback: Optional[str]
+
+    # Final Output
+    final_answer: Optional[str]
+    final_result: Any
+
