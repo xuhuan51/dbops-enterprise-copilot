@@ -3,14 +3,14 @@
 from typing import List
 from langchain_core.messages import BaseMessage
 
+from app.core.llm import get_llm
 # ✅ 引入核心定义
 from app.core.state import AgentState, RouterOutput, IntentType
 from app.core.prompts import ONE_PASS_ROUTER_PROMPT
-from app.core.llm import get_router_llm
 from app.core.logger import logger
 
 # 初始化 Router 专用模型 (推荐用速度快的模型，如 gpt-4o-mini 或 deepseek-v3)
-router_llm = get_router_llm()
+router_llm = get_llm()
 
 
 def _format_history(history: List[BaseMessage]) -> str:

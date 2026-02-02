@@ -45,17 +45,14 @@ def _format_schema_context(retrieved_columns: List[Dict[str, Any]]) -> str:
 
 async def retrieval_node(state: AgentState) -> Dict[str, Any]:
     """
-    Retrieval Node:
-    连接 AgentState 和 RAGOrchestrator 的桥梁。
+    Retrieval Node: 连接 AgentState 和 RAGOrchestrator 的桥梁。
     """
     trace_id = state.get("trace_id", "N/A")
-    question = state.get("question", "")
     intent_data = state.get("intent_data")
 
     logger.info(f"🚀 [Retrieval Node] Start processing trace_id={trace_id}")
 
     # 1. 检查是否需要检索
-    # (虽然图路由通常已经保证了这点，但双重检查更安全)
     if intent_data and not intent_data.needs_schema:
         logger.info("ℹ️ [Retrieval Node] Skipped (needs_schema=False).")
         return {
@@ -63,12 +60,12 @@ async def retrieval_node(state: AgentState) -> Dict[str, Any]:
             "retrieved_columns": [],
             "schema_str": "",
             "join_paths": [],
-            "business_rules": []
+            "business_rules": [],
+            "value_matches": []  # 保持空列表一致性
         }
 
     try:
-        # 2. 调用 Orchestrator (核心分治检索逻辑在这里执行)
-        # 注意：这里直接传 state，因为我们在 Orchestrator 里改成了接收 state
+        # 2. 调用 Orchestrator
         context = await orchestrator.get_retrieval_context(state)
 
         # 3. 提取结果
@@ -77,25 +74,31 @@ async def retrieval_node(state: AgentState) -> Dict[str, Any]:
         rules = context.get("business_rules", [])
         retrieved_tables = context.get("retrieved_tables", [])
 
-        # 4. 格式化 Schema 字符串 (关键步骤！)
-        # Generator 写 SQL 时，是看不到原始 list 的，只能看到这个 string
+        # 🔥🔥🔥 [修复点 1] 提取值匹配结果 🔥🔥🔥
+        value_matches = context.get("value_matches", [])
+
+        # 4. 格式化 Schema
         schema_str = _format_schema_context(retrieved_cols)
 
-        logger.info(f"✅ [Retrieval Node] Done. Found {len(retrieved_tables)} tables, {len(retrieved_cols)} cols.")
+        logger.info(
+            f"✅ [Retrieval Node] Done. Found {len(retrieved_tables)} tables, {len(retrieved_cols)} cols, {len(value_matches)} matches.")
 
         # 5. 更新 State
         return {
-            "retrieved_tables": retrieved_tables,  # 表名列表
-            "retrieved_columns": retrieved_cols,  # 详细列信息(List[Dict])
-            "schema_str": schema_str,  # 给 LLM 看的格式化文本
-            "join_paths": join_paths,  # 图谱路径
-            "business_rules": rules  # 知识库规则
+            "retrieved_tables": retrieved_tables,
+            "retrieved_columns": retrieved_cols,
+            "schema_str": schema_str,
+            "join_paths": join_paths,
+            "business_rules": rules,
+
+            # 🔥🔥🔥 [修复点 2] 必须把它传回给 State 🔥🔥🔥
+            "value_matches": value_matches
         }
 
     except Exception as e:
         logger.error(f"❌ [Retrieval Node] Failed: {e}", exc_info=True)
-        # 降级策略：返回空，让 Generator 尝试根据常识或报错
         return {
             "error_message": f"Retrieval failed: {str(e)}",
-            "schema_str": "Error during retrieval."
+            "schema_str": "Error during retrieval.",
+            "value_matches": []  # 兜底
         }

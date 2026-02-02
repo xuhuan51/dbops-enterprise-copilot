@@ -213,91 +213,57 @@ ERROR_CLASSIFY_PROMPT = """
 请提取用于去知识库补搜的关键词 (search_keywords)。如果是 SYNTAX_ERROR，请输出空列表。
 """
 
-
 GEN_SQL_PROMPT = """
-你是一个基于 MySQL 的智能 SQL 生成器 (DBOps Copilot)。
-你的任务是将自然语言转换为可执行、精准的 SQL。
+你是一个严谨的 SQL 生成专家。
+你的目标：生成严格遵守给定约束的可执行 SQL。
 
-注意：本次调用会使用结构化输出解析（Pydantic）。因此你**必须且只能输出一个 JSON 对象**，不要输出 Markdown，不要输出任何解释文本。
+注意：本次调用强制使用结构化输出。你**必须且只能输出一个 JSON 对象**。
 
-### [1. 业务知识库 - 核心参考]
-{knowledge_context}
-(包含：业务术语定义、表映射关系、特定计算公式、SQL 片段。**必须优先采纳此处的逻辑**。)
-
-### [2. 候选表 Schema - 唯一事实标准]
+### [1. 数据库 Schema (事实标准)]
 {schema_context}
-(包含：表名、字段名、字段类型。SQL 中的所有表和字段必须来源于此。)
 
-### [3. 相似案例 - Golden SQL]
-{golden_sql_context}
-(包含：历史正确 SQL。如果问题相似，**请直接模仿其 JOIN 逻辑和 WHERE 写法**。)
+### [2. 🔴 强制约束 (最高优先级)]
+以下约束是基于数据库内容或业务规则的**事实**。你必须无条件遵守。忽略这些约束将导致 SQL 执行失败。
+{constraints_context}
 
-### [4. 历史对话]
-{history_context}
+### [3. 外部知识 (参考)]
+{knowledge_context}
 
-### [5. 历史报错修正]
-{error_context}
+### [4. 表连接路径 (Join Paths)]
+{join_paths_context}
 
-### [当前用户问题]
-{question}
-
-========================
-### 核心生成规则 (Violations will cause errors)
-
-1) **Schema 绝对一致性原则 (Strict Consistency)**：
-   - **表名格式**：请严格照抄 [候选表 Schema] 中展示的表名格式。
-     - 如果 Schema 展示为 `corp_trade.t_order`，你就必须写 `FROM corp_trade.t_order`。
-     - 如果 Schema 展示为 `t_order`，你就必须写 `FROM t_order`。
-     - **严禁**自行添加或去除数据库前缀，防止 Proxy 路由失败。
-   - **字段白名单**：绝对禁止使用 Schema 中不存在的字段（如 `user_name`, `dept_id`），除非 Schema 明确包含它们。
-
-2) **ShardingSphere 逻辑表规范**：
-   - **忽略物理后缀**：严禁在 SQL 中出现 `_000`, `_127`, `2025W01` 等物理分片后缀。始终使用逻辑表名（如 `t_order`, `log_api_access`）。
-   - **别名强制**：所有表必须使用简短别名（如 `t`, `u`, `o`），字段引用必须带别名（如 `o.order_id`）。
-
-3) **业务逻辑优先 (Knowledge First)**：
-   - 如果 [业务知识库] 中提供了 `sql_snippet`（例如某指标的计算公式、某表的特定过滤条件），**必须直接使用**。
-   - 如果用户提到“黑话”（如“大R用户”），请根据知识库将其转换为对应的 SQL 逻辑（如 `amount > 10000`）。
-
-4) **时间与函数规范**：
-   - 使用 MySQL 标准时间函数：`NOW()`, `CURDATE()`, `DATE_SUB(NOW(), INTERVAL 7 DAY)`。
-   - 禁止使用字符串硬编码时间（除非用户指定了具体日期）。
-   - 禁止使用非 MySQL 函数（如 `to_date`，或 `datediff` 参数错误等）。
-
-5) **未知熔断机制 (Fail-Closed)**：
-   - 如果用户问的概念（如“工资”）在 Schema 和 知识库 中都找不到依据：
-     - SQL 输出为：`SELECT 'ERR::NO_RELEVANT_TABLE' AS error;`
-   - 如果需要 JSON 里的字段但无法确定 Key：
-     - SQL 输出为：`SELECT 'ERR::NEED_JSON_KEY::KeyName' AS error;`
-   - 如果缺少关键字段定义/表信息导致无法写 SQL：
-     - SQL 输出为：`SELECT 'ERR::NEED_SCHEMA_FIELD::FieldName' AS error;`
-
-6) **结果限制**：
-   - 如果查询结果可能很大且无聚合（GROUP BY），请默认添加 `LIMIT 20`。
-
-7) **可执行性**：
-   - 生成的 SQL 必须是 MySQL 可执行的单条语句，并以分号 `;` 结尾。
+### [5. 历史记录与当前问题]
+对话历史: {history_context}
+当前问题: {question}
 
 ========================
-### 输出格式 (JSON Only)
+### 🧠 认知绑定协议 (思考过程)
+在编写 SQL 之前，你必须在 `thought` 字段中显式确认并“绑定”上述约束：
 
-你必须且只能输出一个 JSON 对象，字段如下：
+1. **实体绑定检查 (Entity Binding)**: 我是否发现了关于特定值的 '🔴 强制约束'？
+   - 如果有：我必须**抛弃**用户口语中的词，**替换**为约束中给出的数据库真实值。
+   - 例如：用户说 "continuation" -> 约束说数据库里叫 "Continuation School" -> 我必须写 `WHERE col = 'Continuation School'`。
+
+2. **指标绑定检查 (Metric Binding)**: 我是否发现了关于计算公式的 '🔴 强制约束'？
+   - 如果有：我必须利用原始列构建计算公式。
+   - 例如：约束说 "率 = A / B" -> 我必须写 `SELECT A / B`，并忽略任何名为 "Rate" 的预计算列。
+
+### 🚫 负面约束 (禁止事项)
+1. **严禁幻觉**: 绝对不要使用 Schema 中不存在的列。
+2. **严禁模糊匹配**: 如果约束中提供了具体值，请**原样复制**，不要对其进行简化或模糊处理。
+
+========================
+### 输出格式 (仅 JSON)
+
 {{
-  "sql": "最终 SQL 字符串（必须以 ; 结尾；或熔断 ERR:: 语句）",
-  "assumptions": ["可选：你做出的必要假设，最多 5 条；没有则 []"],
-  "tables_used": ["可选：本 SQL 使用到的表名（按 Schema 中的表名格式），没有则 []"],
-  "confidence": 0.0
+  "thought": "步骤1: 绑定检查。发现了 'Alameda' 的约束 -> 映射为 'Alameda County'。发现了 'rate' 的公式约束 -> 使用 Count/Enrollment 计算。步骤2: 构建 SQL...",
+  "sql": "SELECT ...",
+  "used_tables": ["table_name"]
 }}
-
-约束：
-- 不要输出任何额外文字，不要用 Markdown。
-- `sql` 字段里只放 SQL，不要把 SQL 写到 JSON 之外。
-- `suggested_search_keywords` 不在本输出中出现（那是反思/修复阶段的职责）。
-
-开始输出 JSON：
 """
 
-# app/core/prompts.py (更新 REFLECTION_PROMPT)
+
+
 REFLECTION_PROMPT = """
 你是一名严格的 SQL 代码审查员。
 你的任务：检查 SQL 是否在【Schema事实】约束下，能够回答【用户问题】。

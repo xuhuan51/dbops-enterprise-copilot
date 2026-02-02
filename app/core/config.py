@@ -61,7 +61,7 @@ class Settings:
     LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
     # 💡 建议：将 localhost 统一改为 127.0.0.1 避开部分系统的 IPv6 代理坑
     LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434/v1")
-    LLM_MODEL = os.getenv("LLM_MODEL_NAME", "qwen2.5:14b")
+    LLM_MODEL = os.getenv("LLM_MODEL_NAME", "qwen2.5-coder:14b")
 
     EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
     RERANK_MODEL = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")

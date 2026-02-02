@@ -5,10 +5,10 @@ from typing import Dict, Any
 
 from app.core.state import AgentState, CapabilityExpandOutput
 from app.core.prompts import CAPABILITY_EXPAND_PROMPT
-from app.core.llm import get_router_llm
+from app.core.llm import get_llm
 from app.core.logger import logger
 
-llm = get_router_llm()
+llm = get_llm()
 
 ALLOWED_CAPS = {
     "LOOKUP",

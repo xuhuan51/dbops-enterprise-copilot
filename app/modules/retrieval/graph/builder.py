@@ -9,28 +9,26 @@ from sklearn.metrics.pairwise import cosine_similarity
 from app.core.config import settings
 from app.core.logger import logger
 
-try:
-    from app.core.rag_store import encoder
-except ImportError:
-    logger.warning("⚠️ [GraphBuilder] encoder not found. Semantic matching disabled.")
-    encoder = None
-
 
 class SchemaGraphBuilder:
     """
     🏆 SOTA Strategy V2: Robust & Multi-Path
-
-    Changes from V1:
-    - Base: nx.MultiGraph (Allow parallel edges)
-    - Filter: Smart ignore (Keys are never ignored)
-    - Content: Cardinality check (Avoid enum overlap)
-    - Injection: Better plural handling (categories -> category)
-    - Edge: Structured attributes (u_col, v_col)
     """
 
-    def __init__(self, catalog_data: List[Dict[str, Any]]):
+    # 🔥🔥🔥 修改 1: 在这里增加 encoder 参数，默认为 None
+    def __init__(self, catalog_data: List[Dict[str, Any]], encoder: Optional[Any] = None):
         self.raw_catalog = catalog_data
         self.db_groups = collections.defaultdict(list)
+
+        # 🔥🔥🔥 修改 2: 把 encoder 存起来变成实例变量
+        self.encoder = encoder
+
+        # 打印状态日志
+        if self.encoder:
+            logger.info("✅ [GraphBuilder] Encoder loaded. Semantic matching ENABLED.")
+        else:
+            logger.warning("⚠️ [GraphBuilder] Encoder NOT provided. Semantic matching DISABLED.")
+
         self._group_by_db()
 
         self.evidence_dir = os.path.join("../data/bird/metadata/evidence_joins")
@@ -119,7 +117,7 @@ class SchemaGraphBuilder:
         # ---------------------------------------------------------
         # Layer 6: Semantic Matching (Weight 2.0 - 3.0)
         # ---------------------------------------------------------
-        if encoder:
+        if self.encoder:
             self._add_semantic_edges(G, table_map)
 
         return G
@@ -275,7 +273,7 @@ class SchemaGraphBuilder:
         ]
 
         try:
-            vecs = encoder.encode(texts, normalize_embeddings=True)
+            vecs = self.encoder.encode(texts, normalize_embeddings=True)
             # Dot product
             sim_matrix = np.dot(vecs, vecs.T)
 

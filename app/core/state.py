@@ -17,41 +17,11 @@ class IntentType(str, Enum):
     AMBIGUOUS = "AMBIGUOUS"
 
 
-
 # ==========================================
-# 新增：规划线索 (Plan Hints) - 剥离排序/Limit
+# 2. 中间层数据结构 (Expand & Planner)
 # ==========================================
-class PlanHints(BaseModel):
-    limit: Optional[int] = Field(None, description="LIMIT 数量 (e.g. 3)")
-    order_direction: Optional[Literal["ASC", "DESC"]] = Field(None, description="排序方向")
-    agg_method: Optional[Literal["MAX", "MIN", "SUM", "AVG", "COUNT"]] = Field(None, description="聚合方式")
 
-# ==========================================
-# 修改：语义桶 (Semantic Buckets)
-# ==========================================
-class SemanticBuckets(BaseModel):
-    """思维链中间层：需求桶"""
-    entity: List[str] = Field(default_factory=list, description="业务对象 (表级)")
-    metric: List[str] = Field(default_factory=list, description="数值指标 (列级，不含排序词)")
-    filter: List[str] = Field(default_factory=list, description="过滤条件 (保留原短语)")
-    plan_hints: Optional[PlanHints] = Field(None, description="排序与截断信息")
-    target_hint: Optional[str] = Field(None, description="主要对象")
-    metric_hint: Optional[str] = Field(None, description="指标/字段含义")
-    filter_hints: List[str] = Field(default_factory=list, description="过滤原短语")
-    group_hint: Optional[str] = Field(None, description="分组线索")
-    time_hint: Optional[str] = Field(None, description="时间线索")
-
-
-
-# ==========================================
-# 修改：Expand 输出
-# ==========================================
-class ExpandOutput(BaseModel):
-    """Expand Node 输出"""
-    semantic_buckets: SemanticBuckets = Field(..., description="结构化拆解")
-    schema_keywords: List[str] = Field(default_factory=list, description="物理字段关键词列表") # ✅ 改为 List
-    knowledge_keywords: List[str] = Field(default_factory=list, description="严格受控的业务术语")
-
+# 能力类型定义
 CapabilityType = Literal[
     "LOOKUP",
     "FILTER",
@@ -64,9 +34,17 @@ CapabilityType = Literal[
     "JOIN",
 ]
 
+
+class PlanHints(BaseModel):
+    """规划线索：剥离排序/Limit/聚合"""
+    limit: Optional[int] = Field(None, description="LIMIT 数量 (e.g. 3)")
+    order_direction: Optional[Literal["ASC", "DESC"]] = Field(None, description="排序方向")
+    agg_method: Optional[Literal["MAX", "MIN", "SUM", "AVG", "COUNT"]] = Field(None, description="聚合方式")
+
+
 class SemanticHints(BaseModel):
     """
-    Option A: 只保留“人话层”的语义线索，不做 schema 推断
+    语义线索：只保留“人话层”的语义，不做 schema 推断
     """
     target_hint: Optional[str] = Field(None, description="主要对象（如 学校/学生/订单/用户）")
     metric_hint: Optional[str] = Field(None, description="指标/字段含义（如 eligible free rate / zip code）")
@@ -75,17 +53,37 @@ class SemanticHints(BaseModel):
     time_hint: Optional[str] = Field(None, description="时间线索（如 last 30 days / 2023年）")
 
 
+class SemanticBuckets(BaseModel):
+    """思维链中间层：需求桶 (v2.0 旧版保留，用于向前兼容或辅助分析)"""
+    entity: List[str] = Field(default_factory=list, description="业务对象 (表级)")
+    metric: List[str] = Field(default_factory=list, description="数值指标 (列级，不含排序词)")
+    filter: List[str] = Field(default_factory=list, description="过滤条件 (保留原短语)")
+    plan_hints: Optional[PlanHints] = Field(None, description="排序与截断信息")
+    target_hint: Optional[str] = Field(None, description="主要对象")
+    metric_hint: Optional[str] = Field(None, description="指标/字段含义")
+    filter_hints: List[str] = Field(default_factory=list, description="过滤原短语")
+    group_hint: Optional[str] = Field(None, description="分组线索")
+    time_hint: Optional[str] = Field(None, description="时间线索")
+
+
+class ExpandOutput(BaseModel):
+    """Expand Node 输出 (旧版 v2.0)"""
+    semantic_buckets: SemanticBuckets = Field(..., description="结构化拆解")
+    schema_keywords: List[str] = Field(default_factory=list, description="物理字段关键词列表")
+    knowledge_keywords: List[str] = Field(default_factory=list, description="严格受控的业务术语")
+
+
 class CapabilityExpandOutput(BaseModel):
-    """
-    Expand Node 新输出（Option A）
-    """
+    """Expand Node 新输出 (v3.0 Option A)"""
     capabilities: List[CapabilityType] = Field(default_factory=list)
     semantic_hints: SemanticHints = Field(default_factory=SemanticHints)
     search_keywords: List[str] = Field(default_factory=list, description="标准化的英文检索关键词")
 
+
 # ==========================================
 # 3. Router 输出 (决策包)
 # ==========================================
+
 class RouterOutput(BaseModel):
     """
     Router 节点的输出对象，后续会被 Expand 节点填充更多细节。
@@ -107,7 +105,6 @@ class RouterOutput(BaseModel):
     clarify_questions: List[str] = Field(default_factory=list)
 
     # --- 5. 知识库专用词 (Router 负责) ---
-    # Router 可能会专门提取一些业务术语（如 "ROI", "大R"）用于查文档
     knowledge_keywords: List[str] = Field(default_factory=list, description="业务术语/知识库关键词")
 
     # =================================================================
@@ -184,10 +181,13 @@ class AgentState(TypedDict, total=False):
 
     # Retrieval Context
     retrieved_tables: List[str]
-    retrieved_columns: List[Any]  # 原始列信息
+    retrieved_columns: List[Any]  # 原始列信息 (Usually List[Dict])
     schema_str: str  # 格式化后的 Schema
-    graph_hints: List[str]  # Graph Service 算出的路径
+    join_paths: List[str]  # Graph Service 算出的路径 (原名 graph_hints)
     business_rules: List[str]  # 知识库规则
+
+    # 🔥🔥🔥 新增：用于 "First Axe" (Value Linking) 🔥🔥🔥
+    value_matches: List[str]
 
     # Planning
     plan: Optional[SQLPlan]
@@ -207,4 +207,3 @@ class AgentState(TypedDict, total=False):
     # Final Output
     final_answer: Optional[str]
     final_result: Any
-
