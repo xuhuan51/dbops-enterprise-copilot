@@ -50,7 +50,7 @@ def _clean_and_parse_json(text: str) -> Dict[str, Any]:
     s = text.find("{")
     e = text.rfind("}")
     if s != -1 and e != -1 and e > s:
-        text = text[s : e + 1]
+        text = text[s: e + 1]
 
     return json.loads(text)
 
@@ -78,17 +78,35 @@ def _post_validate(out: CapabilityExpandOutput) -> CapabilityExpandOutput:
     if out.semantic_hints.filter_hints is None:
         out.semantic_hints.filter_hints = []
 
-    # 3. 🔥🔥🔥 【新增】: search_keywords 清洗 (转小写 + 去重)
+    # 3. 🔥🔥🔥 【修改】: 适配结构化关键词 (List[KeywordItem])
     if out.search_keywords:
-        # 过滤空字符串，转小写
-        cleaned_kws = [k.strip().lower() for k in out.search_keywords if k and k.strip()]
-        # 去重但保持顺序
-        seen_kw = set()
         dedup_kw = []
-        for k in cleaned_kws:
-            if k not in seen_kw:
-                seen_kw.add(k)
-                dedup_kw.append(k)
+        seen_kw = set()
+
+        for item in out.search_keywords:
+            # 兼容性防御：如果 LLM 偶尔发疯返回了字符串，尝试容错（虽然 Prompt 强约束了）
+            if isinstance(item, str):
+                continue
+
+                # Pydantic 对象访问属性
+            raw_kw = getattr(item, "keyword", "").strip()
+            raw_type = getattr(item, "type", "CONCEPT").upper()
+
+            if not raw_kw:
+                continue
+
+            # 逻辑：VALUE 类型保留原大小写（可能对精确匹配重要），CONCEPT 类型转小写
+            # 但为了去重 key，统一用小写判断
+            dedup_key = (raw_kw.lower(), raw_type)
+
+            if dedup_key not in seen_kw:
+                seen_kw.add(dedup_key)
+
+                # 规范化数据回写
+                item.keyword = raw_kw
+                item.type = raw_type
+                dedup_kw.append(item)
+
         out.search_keywords = dedup_kw
     else:
         out.search_keywords = []
@@ -115,8 +133,12 @@ async def expand_node(state: AgentState):
         print("🧠 [理解结果]:")
         print(f"   - 🧩 Capabilities: {out.capabilities}")
         print(f"   - 🎯 Hints: {out.semantic_hints}")
-        # 🔥 打印关键词，方便调试
-        print(f"   - 🔑 Keywords: {out.search_keywords}")
+
+        # 🔥 打印关键词（展示 Type，方便调试）
+        print("   - 🔑 Keywords:")
+        for k in out.search_keywords:
+            # k 是 KeywordItem 对象
+            print(f"      • [{k.type}] {k.keyword}")
 
     except Exception as e:
         logger.error(f"[Expand] Failed: {e}", extra={"trace_id": trace_id})
@@ -124,17 +146,19 @@ async def expand_node(state: AgentState):
         out = CapabilityExpandOutput()
 
     # =======================================================
-    # 更新 State（Option A：不生成 schema_query）
+    # 更新 State
     # =======================================================
     if intent_data is not None:
         intent_data.capabilities = out.capabilities
         intent_data.semantic_hints = out.semantic_hints
 
-        # 🔥🔥🔥 【新增】: 将关键词存入 RouterOutput，传递给下游 Retriever
+        # ✅ 传递结构化对象列表 (List[KeywordItem])
         intent_data.search_keywords = out.search_keywords
 
-        # (可选) 如果你的老代码还在用 schema_query，可以顺便生成一下兼容
-        intent_data.schema_query = " ".join(out.search_keywords)
+        # ✅ 兼容旧版 schema_query (只提取 keyword 拼接成字符串)
+        # 避免 join 对象导致报错
+        kw_str_list = [k.keyword for k in out.search_keywords]
+        intent_data.schema_query = " ".join(kw_str_list)
 
     print(f"{'=' * 80}\n")
     return {"intent_data": intent_data}

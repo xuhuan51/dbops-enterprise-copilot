@@ -213,54 +213,65 @@ ERROR_CLASSIFY_PROMPT = """
 请提取用于去知识库补搜的关键词 (search_keywords)。如果是 SYNTAX_ERROR，请输出空列表。
 """
 
+
 GEN_SQL_PROMPT = """
-你是一个严谨的 SQL 生成专家。
-你的目标：生成严格遵守给定约束的可执行 SQL。
+你是一个资深 SQL 专家，专门处理 SQLite 数据库生成任务。
+你的目标：生成逻辑正确、且能在 SQLite 环境下精准计算数值的结构化 SQL。
 
 注意：本次调用强制使用结构化输出。你**必须且只能输出一个 JSON 对象**。
 
-### [1. 数据库 Schema (事实标准)]
+========================
+### ✅ SQLite 核心计算与引用规范（最高执行准则）
+1. **数据库引擎：SQLite**
+2. **标识符引用 (Identifier Quoting)**：
+   - 必须对**所有**列名和表名使用 **双引号** (`"col_name"`)，特别是包含空格、括号或百分号的字段。
+3. **数值计算 (Numeric Precision)**：
+   - **浮点数除法补丁**：SQLite 执行 `INT / INT` 会截断小数。在执行除法时，分子必须显式转换为浮点数。
+   - **公式模板**：`(CAST("num_col" AS REAL) / NULLIF("den_col", 0))` 或 `("num_col" * 1.0 / NULLIF("den_col", 0))`。
+4. **分页与过滤**：
+   - 使用 `LIMIT n` 处理 TopK 问题。
+   - 日期处理使用 `date()`, `datetime()` 或 `strftime()`。
+
+========================
+### [1. 数据库 Schema]
 {schema_context}
 
 ### [2. 🔴 强制约束 (最高优先级)]
-以下约束是基于数据库内容或业务规则的**事实**。你必须无条件遵守。忽略这些约束将导致 SQL 执行失败。
 {constraints_context}
 
-### [3. 外部知识 (参考)]
-{knowledge_context}
-
-### [4. 表连接路径 (Join Paths)]
+### [3. 外部知识与连接路径]
+{rules_context}
 {join_paths_context}
 
-### [5. 历史记录与当前问题]
+### [4. 任务背景]
 对话历史: {history_context}
 当前问题: {question}
 
 ========================
-### 🧠 认知绑定协议 (思考过程)
-在编写 SQL 之前，你必须在 `thought` 字段中显式确认并“绑定”上述约束：
+### 🧠 认知绑定协议 (思维链 CoT)
+在生成 SQL 之前，你必须在 `thought` 字段中显式执行以下**逻辑拆解**（这是最重要的一步）：
 
-1. **实体绑定检查 (Entity Binding)**: 我是否发现了关于特定值的 '🔴 强制约束'？
-   - 如果有：我必须**抛弃**用户口语中的词，**替换**为约束中给出的数据库真实值。
-   - 例如：用户说 "continuation" -> 约束说数据库里叫 "Continuation School" -> 我必须写 `WHERE col = 'Continuation School'`。
-
-2. **指标绑定检查 (Metric Binding)**: 我是否发现了关于计算公式的 '🔴 强制约束'？
-   - 如果有：我必须利用原始列构建计算公式。
-   - 例如：约束说 "率 = A / B" -> 我必须写 `SELECT A / B`，并忽略任何名为 "Rate" 的预计算列。
-
-### 🚫 负面约束 (禁止事项)
-1. **严禁幻觉**: 绝对不要使用 Schema 中不存在的列。
-2. **严禁模糊匹配**: 如果约束中提供了具体值，请**原样复制**，不要对其进行简化或模糊处理。
+1. **逻辑规划 (Decomposition)**:
+   - **Step 1 拆解**：这个问题需要分几步？(例如：先筛选A表，再连接B表，最后统计)
+   - **Step 2 定位**：涉及哪几张表？**连接键是什么？** (必须优先参考 [3. 外部知识] 中的 Join 规则，如 CDSCode)
+   - **Step 3 条件**：有哪些过滤条件？(例如：virtual='F', math>400)
+2. **实体绑定 (Entity Grounding)**:
+   - 检查 [2. 强制约束] 和 [3. 外部知识]。
+   - 如果规则指出 "exclusively virtual" 意味着 `Virtual` = 'F'，你**必须**使用 'F'，严禁使用 'P' 或其他值。
+3. **计算对齐 (Calculation Alignment)**:
+   - 涉及除法时，是否使用了 `CAST(... AS REAL)`？
+4. **语法自检 (SQLite Audit)**:
+   - 是否对列名加了双引号？
 
 ========================
 ### 输出格式 (仅 JSON)
-
 {{
-  "thought": "步骤1: 绑定检查。发现了 'Alameda' 的约束 -> 映射为 'Alameda County'。发现了 'rate' 的公式约束 -> 使用 Count/Enrollment 计算。步骤2: 构建 SQL...",
+  "thought": "1. 逻辑规划：先在 schools 表筛选 Virtual='F' (严格遵守规则)，再 JOIN satscores 表筛选 AvgScrMath>400，最后 COUNT。连接键为 CDSCode。... 2. 实体绑定：已确认 'exclusively virtual' 对应 Virtual='F'。",
   "sql": "SELECT ...",
   "used_tables": ["table_name"]
 }}
 """
+
 
 
 
@@ -393,12 +404,13 @@ CLARIFY_PROMPT = """
 
 CAPABILITY_EXPAND_PROMPT = """
 你是一个【查询语义理解与检索桥接模块】。
-你的任务是将用户的自然语言问题（可能是中文或英文）转换为**结构化的语义意图**和**标准化的英文检索关键词**。
+你的任务是将用户的自然语言问题（可能是中文或英文）转换为**结构化的语义意图**和**带有类型标记的检索关键词**。
 
 ### 核心原则
-1. **语义抽象**: 理解用户“想要什么指标”和“有什么限制条件”，而不是去猜数据库表名。
-2. **检索增强**: 数据库列名和注释是**英文**的。你必须将提取的核心概念翻译为**英文关键词列表**，供搜索引擎使用。
-3. **严禁幻觉**: 绝对不要编造具体的 SQL、Table Name（如 t_users）或 Field Name（如 user_id）。
+1. **语义抽象**: 理解用户“想要什么指标”和“有什么限制条件”。
+2. **检索增强**: 数据库 Schema 是英文的。你必须将提取的核心概念翻译为**英文**。
+3. **类型分离**: 必须严格区分“通用概念”（如 Rate, School）和“具体实体值”（如 Alameda, K-12）。
+4. **严禁幻觉**: 绝对不要编造具体的 SQL、Table Name。
 
 ========================
 任务一：抽取能力桶 (Capabilities)
@@ -416,7 +428,7 @@ CAPABILITY_EXPAND_PROMPT = """
 ========================
 任务二：提取语义线索 (Semantic Hints)
 ========================
-提取自然语言层面的含义（保持原语言或翻译为英文均可，重点是描述准确）：
+提取自然语言层面的含义：
 - target_hint : 用户关注的主体对象 (如: school, student)
 - metric_hint : 用户想要查的具体数值/属性 (如: zip code, free lunch rate)
 - filter_hints: 具体的筛选条件值 (如: Alameda County, K-12, Charter)
@@ -426,18 +438,39 @@ CAPABILITY_EXPAND_PROMPT = """
 ========================
 任务三：生成检索关键词 (Search Keywords) - 关键！
 ========================
-为了在数据库 Schema (表名/列名/注释) 中检索，请输出一个**英文关键词列表**：
-1. **翻译**: 将所有中文概念转为英文 (e.g., "免费午餐" -> "free", "lunch", "meal")。
-2. **分解**: 将复合词拆解为原子词 (e.g., "school_id" -> "school", "id")。
-3. **值保留**: 保留核心的专有名词/过滤值 (e.g., "Fresno", "Alameda")。
-4. **去噪**: 去除停用词 (the, is, of, in, all, list, please)。
+请输出一个对象列表，每个对象包含 `keyword` (英文) 和 `type`。
+**Type 分类标准：**
+1. **CONCEPT (概念)**: 
+   - 表名、列名、通用名词、属性名。
+   - 例子: "school", "student", "rate", "percent", "count", "zip code", "district"
+   - **用途**: 仅用于向量检索 Schema。
 
-示例：
-User: "List the zip code of charter schools in Fresno"
-Keywords: ["zip", "code", "charter", "school", "fresno", "county"]
+2. **VALUE (值)**: 
+   - 具体的专有名词、地名、机构名、ID、代码、特定的类型值。
+   - 例子: "Fresno", "Alameda", "K-12", "Charter", "90210", "California"
+   - **用途**: 用于去数据库内容中进行精确/模糊匹配。
 
-User: "最高免费午餐比例的 K-12 学校"
-Keywords: ["highest", "free", "lunch", "meal", "rate", "eligible", "k_12", "school"]
+**处理步骤:**
+1. **翻译**: 将中文转英文 (e.g., "免费" -> "free")。
+2. **分解**: 复合词需保留整体或拆解 (e.g., "Fresno County" -> VALUE "Fresno", CONCEPT "County")。
+3. **去噪**: 去除停用词。
+
+**示例：**
+User: "List zip codes for charter schools in Fresno"
+Keywords: [
+  {"keyword": "zip code", "type": "CONCEPT"},
+  {"keyword": "school",   "type": "CONCEPT"},
+  {"keyword": "charter",  "type": "VALUE"},    <-- 这是一个具体的学校类型
+  {"keyword": "Fresno",   "type": "VALUE"}     <-- 这是一个地名
+]
+
+User: "Alameda County 的 K-12 学校"
+Keywords: [
+  {"keyword": "Alameda",  "type": "VALUE"},    <-- 专名
+  {"keyword": "County",   "type": "CONCEPT"},  <-- 通用名
+  {"keyword": "K-12",     "type": "VALUE"},    <-- 具体学段代码
+  {"keyword": "school",   "type": "CONCEPT"}
+]
 
 ========================
 输出格式 (Strict JSON)
@@ -451,7 +484,9 @@ Keywords: ["highest", "free", "lunch", "meal", "rate", "eligible", "k_12", "scho
     "group_hint": null,
     "time_hint": null
   },
-  "search_keywords": [] 
+  "search_keywords": [
+    {"keyword": "string", "type": "CONCEPT" or "VALUE"}
+  ]
 }
 
 ========================

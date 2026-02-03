@@ -73,11 +73,6 @@ class ExpandOutput(BaseModel):
     knowledge_keywords: List[str] = Field(default_factory=list, description="严格受控的业务术语")
 
 
-class CapabilityExpandOutput(BaseModel):
-    """Expand Node 新输出 (v3.0 Option A)"""
-    capabilities: List[CapabilityType] = Field(default_factory=list)
-    semantic_hints: SemanticHints = Field(default_factory=SemanticHints)
-    search_keywords: List[str] = Field(default_factory=list, description="标准化的英文检索关键词")
 
 
 # ==========================================
@@ -207,3 +202,19 @@ class AgentState(TypedDict, total=False):
     # Final Output
     final_answer: Optional[str]
     final_result: Any
+
+
+# app/core/state.py
+
+class KeywordItem(BaseModel):
+    keyword: str
+    type: Literal["CONCEPT", "VALUE"]
+
+
+class CapabilityExpandOutput(BaseModel):
+    """Expand Node 新输出 (v3.0)"""
+    capabilities: List[CapabilityType] = Field(default_factory=list)
+    semantic_hints: SemanticHints = Field(default_factory=SemanticHints)
+
+    # 🔥 修改这里：支持结构化对象，同时也兼容旧的字符串列表（为了稳健性）
+    search_keywords: List[KeywordItem] = Field(default_factory=list, description="带类型的关键词列表")
