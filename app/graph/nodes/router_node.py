@@ -9,7 +9,7 @@ from app.core.state import AgentState, RouterOutput, IntentType
 from app.core.prompts import ONE_PASS_ROUTER_PROMPT
 from app.core.logger import logger
 
-# 初始化 Router 专用模型 (推荐用速度快的模型，如 gpt-4o-mini 或 deepseek-v3)
+
 router_llm = get_llm()
 
 

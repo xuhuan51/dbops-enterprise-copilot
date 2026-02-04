@@ -1,6 +1,7 @@
 # app/graph/nodes/expand_node.py
 
 import json
+import re
 from typing import Dict, Any
 
 from app.core.state import AgentState, CapabilityExpandOutput
@@ -25,34 +26,32 @@ ALLOWED_CAPS = {
 
 def _clean_and_parse_json(text: str) -> Dict[str, Any]:
     """
-    鲁棒 JSON 提取：
-    1) 去 ```json``` 包裹
-    2) 截取最外层 { ... }
-    3) json.loads
+    鲁棒 JSON 提取 (修复版)：
+    优先尝试正则提取，提取不到尝试直接解析，最后报错。
     """
-    if text is None:
-        raise ValueError("LLM returned None content")
+    if not text:
+        raise ValueError("LLM returned Empty content")
 
     text = text.strip()
 
-    if "```" in text:
-        if "```json" in text:
-            try:
-                text = text.split("```json", 1)[1].split("```", 1)[0].strip()
-            except Exception:
-                text = text.split("```", 1)[1].split("```", 1)[0].strip()
-        else:
-            try:
-                text = text.split("```", 1)[1].split("```", 1)[0].strip()
-            except Exception:
-                pass
+    # 1. 尝试使用正则提取最外层的 JSON 对象
+    # 匹配 { 开始，到 } 结束，DOTALL 允许跨行
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if match:
+        json_str = match.group(1)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass  # 正则提取的如果解不开，继续往下走
 
-    s = text.find("{")
-    e = text.rfind("}")
-    if s != -1 and e != -1 and e > s:
-        text = text[s: e + 1]
+    # 2. 如果正则失败，尝试清理 Markdown 代码块标记后解析
+    clean_text = re.sub(r"^```(json)?|```$", "", text, flags=re.MULTILINE).strip()
 
-    return json.loads(text)
+    try:
+        return json.loads(clean_text)
+    except json.JSONDecodeError:
+        # 3. 实在解不开，打印前100个字符方便调试
+        raise ValueError(f"无法解析 JSON: {text[:100]}...")
 
 
 def _render_prompt_safe(template: str, question: str) -> str:
@@ -125,6 +124,8 @@ async def expand_node(state: AgentState):
         prompt = _render_prompt_safe(CAPABILITY_EXPAND_PROMPT, question)
         resp = await llm.ainvoke(prompt)
         content = getattr(resp, "content", None)
+
+        print(f"👻 [Expand Raw Output]: {str(content)[:200]}...")
 
         parsed = _clean_and_parse_json(content)
         out = CapabilityExpandOutput(**parsed)

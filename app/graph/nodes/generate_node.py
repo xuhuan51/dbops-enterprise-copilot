@@ -1,123 +1,73 @@
-# app/graph/nodes/generate_node.py
 import re
-from typing import Dict, Any, List
 import json
+from typing import Dict, Any, List
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
 from app.core.config import settings
 from app.core.llm import get_llm
-from app.core.prompts import GEN_SQL_PROMPT
 from app.core.state import AgentState
 from app.core.logger import logger
 
+# 🔥🔥🔥 重点：直接从你的 prompt 文件导入，不再重复定义
+from app.core.prompts import GEN_SQL_PROMPT
+
+
+# ==============================================================================
+# 🛠️ 辅助函数
+# ==============================================================================
 
 def _format_history(history: List[Any]) -> str:
-    """
-    将聊天记录格式化为清晰的上下文文本
-    """
-    if not history:
-        return "无 (这是第一轮对话)"
-
+    if not history: return "无 (这是第一轮对话)"
     context_lines = []
-    # 只取最近的 6 轮对话，避免 Prompt 过长
     for msg in history[-6:]:
         if isinstance(msg, HumanMessage):
             context_lines.append(f"User: {msg.content}")
         elif isinstance(msg, AIMessage):
-            content = msg.content
-            if "{" in content and "sql" in content:
-                try:
-                    if "```json" in content:
-                        clean_content = content.split("```json")[1].split("```")[0].strip()
-                        data = json.loads(clean_content)
-                    else:
-                        data = json.loads(content)
-
-                    sql = data.get("sql", "")
-                    if sql:
-                        context_lines.append(f"AI Generated SQL: {sql}")
-                    else:
-                        context_lines.append(f"AI: {content[:100]}...")
-                except:
-                    context_lines.append(f"AI: {content[:100]}...")
-            else:
-                context_lines.append(f"AI: {content[:100]}...")
-
+            content = str(msg.content)[:200].replace("\n", " ")
+            context_lines.append(f"AI: {content}...")
     return "\n".join(context_lines)
 
 
-def _clean_json_output(raw_content: str) -> Dict[str, Any]:
+def _parse_markdown_output(raw_content: str) -> Dict[str, Any]:
     """
-    清洗并解析 JSON 输出 (v5.2: 鲁棒性增强版)
-    针对模型输出的非法转义符、换行符以及 JSON 结构损坏进行自动修复。
+    🔥 解析 Markdown 分块输出 (比 JSON 更稳健)
     """
     if not raw_content:
         return {"sql": "", "thought": "Empty input."}
 
-    # 1. 提取 Markdown 中的 JSON 代码块
     txt = raw_content.strip()
-    if "```json" in txt:
-        txt = txt.split("```json", 1)[1].split("```", 1)[0]
-    elif "```" in txt:
-        txt = txt.split("```", 1)[1].split("```", 1)[0]
 
-    txt = txt.strip()
+    # 1. 提取 Thought
+    thought = ""
+    # 匹配 ```thought ... ``` 或者在 ```sql 之前的内容
+    thought_match = re.search(r"```thought\s*(.*?)\s*```", txt, re.DOTALL | re.IGNORECASE)
+    if thought_match:
+        thought = thought_match.group(1).strip()
+    else:
+        # 兜底：如果没写 thought block，就把 SQL 之前的所有内容当做 thought
+        sql_start = txt.find("```sql")
+        if sql_start > 0:
+            thought = txt[:sql_start].strip()
 
-    try:
-        # 2. 尝试初步清理并解析
-        # 替换掉模型最爱乱写的 \' (JSON 规范只允许 \")
-        # 处理掉可能存在的单反斜杠
-        processed_txt = txt.replace("\\'", "'")
-        return json.loads(processed_txt)
+    # 2. 提取 SQL
+    sql = ""
+    sql_match = re.search(r"```sql\s*(.*?)\s*```", txt, re.DOTALL | re.IGNORECASE)
+    if sql_match:
+        sql = sql_match.group(1).strip()
+    else:
+        # 兜底：找 SELECT ... ;
+        raw_sql_match = re.search(r"(SELECT .*?;)", txt, re.DOTALL | re.IGNORECASE)
+        if raw_sql_match:
+            sql = raw_sql_match.group(1).strip()
 
-    except Exception as e:
-        logger.warning(f"⚠️ [JSON Fixer] Standard parse failed, trying advanced recovery: {e}")
+    # 清洗 SQL (去掉可能存在的 markdown 标记残留)
+    if sql:
+        sql = sql.replace("```", "").strip()
 
-        try:
-            # 3. 进阶清理：处理 JSON 字符串中的非法换行符
-            # 逻辑：在 JSON 的 key-value 结构中，如果双引号之间有换行，会导致解析失败
-            # 这里用正则尝试清理掉 thought 字段里的非法换行
-            fixed_txt = re.sub(r'("thought":\s*")(.*?)("\s*,\s*"sql")',
-                               lambda m: m.group(1) + m.group(2).replace('\n', '\\n') + m.group(3),
-                               processed_txt, flags=re.DOTALL)
-            return json.loads(fixed_txt)
-        except:
-            # 4. 🛡️ 终极兜底：正则暴力提取 SQL (不管 JSON 是否完整)
-            # 哪怕整个 JSON 格式全乱了，只要里面有 "sql": "SELECT..." 就能救回来
-            logger.error("🚨 [JSON Fixer] Advanced recovery failed. Falling back to Regex extraction.")
+    if not sql:
+        return {"sql": "", "thought": thought, "error": "No SQL found in output"}
 
-            # 提取 SQL (支持跨行)
-            sql_match = re.search(r'"sql":\s*"(SELECT.*?)"', txt, re.DOTALL | re.IGNORECASE)
-            # 提取 Thought (尽量拿)
-            thought_match = re.search(r'"thought":\s*"(.*?)"', txt, re.DOTALL | re.IGNORECASE)
-
-            if sql_match:
-                # 把里面的转义引号还原回来
-                sql = sql_match.group(1).replace('\\"', '"').strip()
-                thought = thought_match.group(1) if thought_match else "Recovered via regex."
-                return {
-                    "sql": sql,
-                    "thought": f"[Regex Recovered] {thought}",
-                    "used_tables": []  # 兜底补齐字段
-                }
-
-    # 5. 彻底完蛋
-    return {
-        "sql": "",
-        "thought": "Failed to recover SQL from raw output.",
-        "error": "unrecoverable_json_error"
-    }
-
-
-def _is_hard_constraint(line: str) -> bool:
-    """
-    只有 🔴 CONSTRAINT 开头才算强约束。
-    其它（🟡 HINT / HINT: / 任何不确定）一律作为软提示。
-    """
-    if not line:
-        return False
-    s = str(line).strip()
-    return s.startswith("🔴 CONSTRAINT")
+    return {"sql": sql, "thought": thought}
 
 
 def _dedup_keep_order(items: List[str], limit: int | None = None) -> List[str]:
@@ -125,20 +75,16 @@ def _dedup_keep_order(items: List[str], limit: int | None = None) -> List[str]:
     out = []
     for x in items:
         x = (x or "").strip()
-        if not x:
-            continue
-        if x in seen:
-            continue
+        if not x or x in seen: continue
         seen.add(x)
         out.append(x)
-        if limit is not None and len(out) >= limit:
-            break
-    return out
+    return out[:limit] if limit else out
 
 
 async def generate_node(state: AgentState) -> Dict[str, Any]:
     """
-    Generator Node: 注入 History + Schema + Rules + Paths + ValueMatches
+    Generator Node (Revised: Logic Flattening Strategy)
+    不强制区分硬约束/软约束，将所有规则平铺给 LLM，依赖模型自身推理能力。
     """
     question = state.get("question", "")
     history = state.get("history", [])
@@ -146,136 +92,133 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
     schema_str = state.get("schema_str", "")
     join_paths = state.get("join_paths", [])
     business_rules = state.get("business_rules", [])
-    value_matches = state.get("value_matches", [])  # List[str]，里面可能混入 🔴/🟡
+    value_matches = state.get("value_matches", [])
+    few_shot_examples = state.get("few_shot_examples", [])
 
     history_context = _format_history(history)
 
     # ----------------------------------------------------
-    # ✅ 核心修复：硬约束/软提示分流
+    # A. 约束处理 (修正版：逻辑降级)
     # ----------------------------------------------------
-    hard_constraints: List[str] = []
-    soft_hints: List[str] = []
-    knowledge_lines: List[str] = []
 
-    # A) 处理 value_matches：🔴 才进 constraints，🟡 全部进 knowledge/hints
+    # 1. 强制过滤器 (Mandatory Filters)
+    # 这些通常是 Value Scanner 找出的具体值 (如 "Year = 2023")，依然作为硬约束
+    hard_filters: List[str] = []
+    soft_hints: List[str] = []
+
     if value_matches:
         for m in value_matches:
             s = str(m).strip()
-            if not s:
-                continue
-            if _is_hard_constraint(s):
-                hard_constraints.append(s)
+            if not s: continue
+            if "CONSTRAINT" in s or "hard" in s.lower():
+                hard_filters.append(s)
             else:
-                # 统一归入软提示
                 soft_hints.append(s)
 
-    # B) 处理业务规则：公式类进硬约束，其它进知识
+    # 2. 业务规则 (Business Logic)
+    # 🔥 核心修改：不再检测公式，不再强制升级。
+    # 所有的 RAG 规则都视为同等重要的业务逻辑，放入 general_rules。
+    general_rules: List[str] = []
+
     if business_rules:
         for r in business_rules:
-            # 1. 精准提取：只拿 rule_text
-            txt = ""
-            if isinstance(r, dict):
-                txt = r.get("rule_text") or r.get("doc_text") or ""
-            else:
-                txt = str(r)
-
+            txt = r.get("content") if isinstance(r, dict) else str(r)
             txt = txt.strip()
             if not txt: continue
 
-            # 2. 识别公式特征
-            is_formula = any(op in txt for op in ["/", "+", "-", "*", "=", "sum(", "count("])
-
-            if is_formula:
-                # 3. 语气强化：不仅给公式，还要下“死命令”
-                hard_constraints.append(
-                    f"🔴 MANDATORY CALCULATION: {txt}. "
-                    "YOU MUST use this specific formula. "
-                    "DO NOT use pre-computed average/rate columns from the schema."
-                )
-            else:
-                # 普通业务逻辑（如 Virtual = F）也建议作为硬约束，因为它决定了 WHERE 条件
-                hard_constraints.append(f"🔴 CONSTRAINT: {txt}")
-
-    # 4. 排序：把公式类的约束排在最前面
-    hard_constraints.sort(key=lambda x: "FORMULA" in x, reverse=True)
-
-    # D) 软提示也去重 & 上限（否则 prompt 也会膨胀）
-    soft_hints = _dedup_keep_order(soft_hints, limit=8)
+            # 直接添加，不做公式/非公式的二元分类
+            # 让 Prompt 里的 "CRITICAL RULES" 区块去统一管理这些规则
+            general_rules.append(txt)
 
     # ----------------------------------------------------
-    # 组装 constraints_context / knowledge_context
+    # B. 组装 Context (对应 Prompt 结构)
     # ----------------------------------------------------
-    constraints_str = "\n".join(hard_constraints) if hard_constraints else "No specific mandatory constraints."
 
-    # knowledge_context 里同时放：软提示 + 非公式业务规则
-    knowledge_blocks = []
+    # 1. Mandatory Filters (对应 constraints_context)
+    constraints_str = "No specific mandatory filters."
+    if hard_filters:
+        constraints_str = "\n".join([f"🔴 FILTER: {c}" for c in hard_filters])
+
+    # 2. Business Logic (对应 rules_context)
+    rules_blocks = []
+    if general_rules:
+        # 这里不加 "MANDATORY" 前缀，而是用 emoji 标记，保持中立
+        rules_blocks.extend([f"- 💡 {r}" for r in general_rules])
+
     if soft_hints:
-        knowledge_blocks.append("Soft Hints (optional, do NOT treat as hard filters):")
-        knowledge_blocks.extend([f"- {h}" for h in soft_hints])
+        deduped_hints = _dedup_keep_order(soft_hints, limit=5)
+        if deduped_hints:
+            rules_blocks.append("\n**Matched Value Hints:**")
+            rules_blocks.extend([f"- {h}" for h in deduped_hints])
 
-    if knowledge_lines:
-        knowledge_blocks.append("Business Knowledge (optional):")
-        knowledge_blocks.extend(knowledge_lines)
+    rules_str = "\n".join(rules_blocks) if rules_blocks else "No additional business rules."
 
-    knowledge_context = "\n".join(knowledge_blocks) if knowledge_blocks else "No additional knowledge."
-
-    # --- Paths Context ---
-    paths_context = "No join paths (Single Table)."
+    # 3. Join Paths (对应 join_paths_context)
+    paths_context = "No specific join paths provided."
     if join_paths:
-        paths_context = "\n".join([f"- {str(p)}" for p in join_paths])
+        paths = [str(p) for p in join_paths]
+        # 只要前 5 条最强的路径
+        paths_context = "\n".join(paths[:5])
 
-    # 3) 填充 Prompt
-    prompt = GEN_SQL_PROMPT.format(
-        history_context=history_context,
-        schema_context=schema_str,
-        constraints_context=constraints_str,
-        knowledge_context=knowledge_context,
-        join_paths_context=paths_context,
-        question=question
-    )
+    # 4. Few Shot (对应 few_shot_context)
+    few_shot_str = "No few-shot examples available."
+    if few_shot_examples:
+        ex_lines = []
+        for i, ex in enumerate(few_shot_examples):
+            ex_lines.append(f"--- Example {i + 1} ---")
+            ex_lines.append(f"Q: {ex.get('question', '')}")
+            if ex.get('evidence'): ex_lines.append(f"Note: {ex.get('evidence')}")
+            ex_lines.append(f"SQL: {ex.get('sql', '')}")
+        few_shot_str = "\n".join(ex_lines)
 
-    logger.info(f"🎨 [Generator] Prompt assembled. History len: {len(history)}")
-    if hard_constraints:
-        logger.info(f"💡 [Generator] Injected {len(hard_constraints)} HARD constraints.")
-        for c in hard_constraints[:3]:
-            logger.info(f"   -> {c}")
-    if soft_hints:
-        logger.info(f"🟡 [Generator] Injected {len(soft_hints)} SOFT hints (non-mandatory).")
-        for h in soft_hints[:3]:
-            logger.info(f"   -> {h}")
-
+    # ----------------------------------------------------
+    # C. 调用模型
+    # ----------------------------------------------------
     try:
+        # 填充 Prompt
+        # ⚠️ 请确保 GEN_SQL_PROMPT 里的占位符名称与这里一致
+        prompt = GEN_SQL_PROMPT.format(
+            history_context=history_context,
+            schema_context=schema_str,
+            constraints_context=constraints_str,  # 对应 B. Mandatory Filters
+            rules_context=rules_str,  # 对应 A. Business Logic
+            join_paths_context=paths_context,  # 对应 C. Join Paths
+            few_shot_context=few_shot_str,
+            question=question
+        )
+
+        logger.info(f"🎨 [Generator] Prompt assembled. Rules Count: {len(general_rules)}")
+
+        # 调试：打印一下喂给模型的 Rules，确认没有 "MANDATORY FORMULA" 这种字眼
+        # print(f"DEBUG RULES:\n{rules_str}")
+
         llm = get_llm(model_name=settings.LLM_MODEL)
-        logger.info(f"🤖 [Generator] Invoking Model: {settings.LLM_MODEL} ...")
 
         messages = [
-            SystemMessage(content="You are a strict JSON-speaking SQL expert."),
+            SystemMessage(content="You are a SQL expert. Output ONLY valid Markdown with 'audit' and 'sql' blocks."),
             HumanMessage(content=prompt)
         ]
 
         response = await llm.ainvoke(messages)
 
-        result_json = _clean_json_output(response.content)
-        final_sql = result_json.get("sql", "")
-        thought = result_json.get("thought", "No thought provided.")
+        # 解析
+        result = _parse_markdown_output(response.content)
 
-        if final_sql:
-            final_sql = final_sql.replace("```sql", "").replace("```", "").strip()
-            if not final_sql.endswith(";"):
-                final_sql += ";"
+        final_sql = result.get("sql", "")
+        thought = result.get("thought", "")
+
+        if final_sql and not final_sql.endswith(";"): final_sql += ";"
 
         logger.info(f"📝 [Generator] SQL: {final_sql}")
-        logger.info(f"💭 [Generator] Thought: {thought}")
+        if thought:
+            logger.info(f"💭 [Generator] Audit: {thought}")
 
         return {
             "generated_sql": final_sql,
             "final_answer": final_sql,
-            "thought": thought
+            "generator_thought": thought
         }
 
     except Exception as e:
         logger.error(f"❌ [Generator] Failed: {e}", exc_info=True)
-        return {
-            "error_message": str(e),
-            "generated_sql": ""
-        }
+        return {"generated_sql": "", "error": str(e)}

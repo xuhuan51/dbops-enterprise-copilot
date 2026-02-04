@@ -85,9 +85,16 @@ def _log_retrieval_details(cols: List[Dict], matches: List[str], schema_len: int
     # 4. 打印值匹配
     log_msg.append("-" * 60)
     log_msg.append(f"🎯 Value Matches ({len(matches)}):")
+
     if matches:
         for v in matches:
-            log_msg.append(f"   ✨ {v}")
+            # 🔥🔥🔥 修复点：检查对象是否有 format_constraint 方法 🔥🔥🔥
+            if hasattr(v, "format_constraint"):
+                # 如果是 MatchCandidate 对象，调用它的格式化方法
+                log_msg.append(f"   ✨ {v.format_constraint()}")
+            else:
+                # 如果是普通字符串 (兼容旧逻辑)，直接打印
+                log_msg.append(f"   ✨ {str(v)}")
     else:
         log_msg.append("   (No specific value constraints found)")
 

@@ -1,13 +1,16 @@
+
 import os
-import json
 import pickle
 import time
+import networkx as nx
 from typing import List, Dict, Optional
+
+from fsspec import json
 
 from app.core.config import settings
 from app.core.logger import logger
 
-# 🔥🔥🔥 修改这里：导入你的 embedder 单例，而不是函数
+# 导入你的 embedder 单例
 from app.core.embedding import embedder
 
 from .builder import SchemaGraphBuilder
@@ -19,20 +22,30 @@ class SchemaGraphService:
     Schema Graph 单例服务 (Service Layer)
     """
     _instance = None
+
+    # 显式定义，防止 AttributeError
+    graphs: Dict[str, nx.MultiGraph] = {}
     _searchers: Dict[str, SchemaPathFinder] = {}
     _is_loaded = False
 
     def __new__(cls):
         if not cls._instance:
             cls._instance = super().__new__(cls)
+            # 确保初始化时 graphs 存在（即使为空）
+            cls._instance.graphs = {}
+            cls._instance._searchers = {}
+            cls._instance._is_loaded = False
         return cls._instance
 
     def load_graph(self, catalog_path: str = None):
-        if self._is_loaded:
+        """加载图数据 (缓存优先 -> 构建)"""
+        # 如果已经加载且不为空，直接返回
+        if self._is_loaded and self.graphs:
             return
 
         # 1. 动态确定 catalog_path
         if not catalog_path:
+            # 兼容你的路径逻辑
             current_dir = os.path.dirname(os.path.abspath(__file__))
             project_root = os.path.abspath(os.path.join(current_dir, "../../../.."))
             catalog_path = os.path.join(project_root, "data/bird/metadata/schema_catalog.json")
@@ -46,7 +59,6 @@ class SchemaGraphService:
         # ==========================================
         # 🔥 策略 A: 尝试加载缓存
         # ==========================================
-        # ⚠️ 如果刚才因为没模型导致缓存是残缺的，这里最好手动删一次缓存文件
         if os.path.exists(cache_path):
             json_mtime = os.path.getmtime(catalog_path)
             pkl_mtime = os.path.getmtime(cache_path)
@@ -58,12 +70,17 @@ class SchemaGraphService:
                     with open(cache_path, 'rb') as f:
                         raw_graphs = pickle.load(f)
 
+                    # 🔥 核心修复：必须把加载的数据赋值给 self.graphs
+                    self.graphs = raw_graphs
                     self._init_searchers(raw_graphs)
+
                     logger.info(f"✅ Graph loaded from cache in {time.time() - t0:.2f}s")
                     self._is_loaded = True
                     return
                 except Exception as e:
                     logger.warning(f"⚠️ Cache load failed (will rebuild): {e}")
+                    # 加载失败，重置为空，继续往下走构建流程
+                    self.graphs = {}
             else:
                 logger.info("🔄 [GraphService] Cache is outdated. Rebuilding...")
 
@@ -77,20 +94,21 @@ class SchemaGraphService:
             with open(catalog_path, 'r', encoding='utf-8') as f:
                 catalog_data = json.load(f)
 
-            # ✅ 2. 显式加载模型 (触发你的 Warmup 逻辑)
-            # 虽然 embedder.encode() 会自动加载，但这里显式调用可以让日志更好看
+            # 显式加载模型
             logger.info("🔌 [GraphService] Warming up embedding model...")
             embedder.load_model()
 
-            # ✅ 3. 注入 embedder 到 Builder
-            # 注意：GraphBuilder 内部会调用 encoder.encode()，你的 embedder 刚好有这个方法，完美兼容！
+            # 构建图
             builder = SchemaGraphBuilder(catalog_data, encoder=embedder)
             raw_graphs = builder.build_all()
 
-            # 4. 初始化 Searchers
+            # 🔥 核心修复：赋值给 self.graphs
+            self.graphs = raw_graphs
+
+            # 初始化 Searchers
             self._init_searchers(raw_graphs)
 
-            # 5. 保存缓存
+            # 保存缓存
             try:
                 logger.info(f"💾 [GraphService] Saving cache to {cache_path}...")
                 with open(cache_path, 'wb') as f:
@@ -103,28 +121,59 @@ class SchemaGraphService:
 
         except Exception as e:
             logger.error(f"❌ [GraphService] Init failed: {e}", exc_info=True)
+            self.graphs = {}  # 兜底
 
     def _init_searchers(self, raw_graphs: Dict):
+        """初始化路径搜索器"""
         count = 0
+        self._searchers = {}  # 清空旧的
         for db_id, mg in raw_graphs.items():
             self._searchers[db_id] = SchemaPathFinder(mg)
             count += 1
         return count
 
-    def search_join_path(self, db_id: str, tables: List[str]) -> List[str]:
+    def get_graph(self, db_id: str) -> nx.MultiGraph:
+        """获取指定 DB 的原始图对象 (供 schema_helper 使用)"""
         if not self._is_loaded:
             self.load_graph()
-        if not db_id or not tables:
-            return []
+        return self.graphs.get(db_id)
+
+    def search_join_path(self, db_id: str, tables: List[str]) -> List[str]:
+        """查找 Join 路径 SQL 片段 (供 Generator 参考)"""
+        if not self._is_loaded:
+            self.load_graph()
+
+        # 兼容性处理：如果 tables 为空，直接返回
+        if not tables: return []
+
         finder = self._searchers.get(db_id)
-        if not finder:
-            logger.warning(f"⚠️ [GraphService] No graph found for db: {db_id}")
-            return []
-        return finder.find_path(tables)
+        if finder:
+            return finder.find_path(tables)
+        return []
+
+    # 🔥🔥🔥 新增这个方法供 schema_helper 调用 🔥🔥🔥
+    def get_shortest_join_keys(self, db_id: str, tables: List[str]) -> List[str]:
+        """
+        获取连接这些表所需的关键列名 (Primary Keys / Foreign Keys)
+        用于 RAG 检索后的 Schema 补全。
+        """
+        if not self._is_loaded:
+            self.load_graph()
+
+        if not tables: return []
+
+        finder = self._searchers.get(db_id)
+        if finder:
+            # 调用我们在 Searcher 里刚写的新方法
+            return finder.get_shortest_join_keys(tables)
+        return []
 
     def reload(self):
+        """强制重载"""
         self._is_loaded = False
+        self.graphs.clear()
         self._searchers.clear()
         self.load_graph()
+
 
 graph_service = SchemaGraphService()

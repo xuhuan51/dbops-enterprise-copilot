@@ -17,27 +17,27 @@ from app.graph.nodes.generate_node import generate_node
 # ==============================================================================
 BIRD_DATASET = [
     {
-        "question_id": 3,
+        "question_id": 6,
         "db_id": "california_schools",
-        "question": "What is the unabbreviated mailing street address of the school with the highest FRPM count for K-12 students?",
-        "evidence": "",
-        "SQL": "SELECT T2.MailStreet FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode ORDER BY T1.`FRPM Count (K-12)` DESC LIMIT 1",
+        "question": "Among the schools with the SAT test takers of over 500, please list the schools that are magnet schools or offer a magnet program.",
+        "evidence": "Magnet schools or offer a magnet program means that Magnet = 1",
+        "SQL": "SELECT T2.School FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode WHERE T2.Magnet = 1 AND T1.NumTstTakr > 500",
         "difficulty": "simple"
     },
     {
-        "question_id": 4,
+        "question_id": 7,
         "db_id": "california_schools",
-        "question": "Please list the phone numbers of the direct charter-funded schools that are opened after 2000/1/1.",
-        "evidence": "Charter schools refers to `Charter School (Y/N)` = 1 in the frpm",
-        "SQL": "SELECT T2.Phone FROM frpm AS T1 INNER JOIN schools AS T2 ON T1.CDSCode = T2.CDSCode WHERE T1.`Charter Funding Type` = 'Directly funded' AND T1.`Charter School (Y/N)` = 1 AND T2.OpenDate > '2000-01-01'",
-        "difficulty": "moderate"
+        "question": "What is the phone number of the school that has the highest number of test takers with an SAT score of over 1500?",
+        "evidence": "",
+        "SQL": "SELECT T2.Phone FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode ORDER BY T1.NumGE1500 DESC LIMIT 1",
+        "difficulty": "simple"
     },
     {
-        "question_id": 5,
+        "question_id": 8,
         "db_id": "california_schools",
-        "question": "How many schools with an average score in Math greater than 400 in the SAT test are exclusively virtual?",
-        "evidence": "Exclusively virtual refers to Virtual = 'F'",
-        "SQL": "SELECT COUNT(DISTINCT T2.School) FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode WHERE T2.Virtual = 'F' AND T1.AvgScrMath > 400",
+        "question": "What is the number of SAT test takers of the schools with the highest FRPM count for K-12 students?",
+        "evidence": "",
+        "SQL": "SELECT NumTstTakr FROM satscores WHERE cds = ( SELECT CDSCode FROM frpm ORDER BY `FRPM Count (K-12)` DESC LIMIT 1 )",
         "difficulty": "simple"
     }
 ]
