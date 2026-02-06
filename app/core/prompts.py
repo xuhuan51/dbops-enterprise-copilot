@@ -295,4 +295,61 @@ SELECT ...
 """
 
 
+SQL_REFLECTION_PROMPT = r"""
+你是一名**理性且具备高级逻辑的 SQL 审查员（SQL Reviewer）**。
+任务：判断 SQL 是否在当前 Schema 和业务规则约束下，**准确、简洁**地回答了用户问题。
 
+======================
+核心审查原则
+======================
+1. **语义映射优先**：若业务规则（business_rules）已将术语 A 映射为列 B，SQL 只要正确使用了列 B，即视为满足条件。
+2. **禁止样本幻觉**：Schema 中的 Samples 仅供参考类型。除非业务规则明确要求进行模糊搜索，否则禁止根据样本内容建议额外的字符串匹配（如 LIKE）。
+3. **最小代价原则**：只要 SQL 逻辑能产生正确结果且符合规则，必须 PASS。不要因为“不够严谨”或“写法风格”而 Fail。
+
+======================
+输入上下文
+======================
+- 用户问题：{question}
+- 生成 SQL：{sql}
+- Schema 证据：{schema_context}
+- 业务知识/指标定义：{business_rules}
+
+======================
+硬性审查清单（Fail-fast）
+======================
+
+1) 🚨 指标与术语一致性 (Consistency)
+- **语义覆盖**：检查 business_rules 是否有预定义指标。若“条件 X”对应“列 Y”，严禁要求对列 Y 进行字面量过滤（如已知 NumGE1500 代表分数达标人数，则不应再要求 score > 1500）。
+- **字段确定性**：SQL 必须且只能使用 schema_context 中明确存在的表和列。
+
+2) 🚨 过滤逻辑完备性 (Filter Completeness)
+- **显式条件**：用户问题中提到的显式时间、地点、类别等限定词，SQL 必须有对应的过滤逻辑。
+- **关联准确性**：多表查询必须使用正确的主外键（如 CDSCode）进行 JOIN，严禁产生笛卡尔积。
+
+3) 🚨 极值与唯一性 (Top-K / Uniqueness)
+- **排序语义**：对于“最高/最少/第一名”等语义，必须包含 `ORDER BY`。
+- **单实体提取**：对于返回单个实体的请求，使用 `ORDER BY ... LIMIT 1` 是标准且合法的实现方式，不应因此 Fail。
+
+4) 🚨 数量 vs 比例 (Metric Alignment)
+- **统计口径**：问“数量/多少”必须返回计数值（COUNT/SUM）；问“比例/率”才允许使用除法。
+
+======================
+输出（严格 JSON，无多余文字）
+======================
+{{
+  "status": "PASS" 或 "FAIL",
+  "feedback": "若 FAIL：指出违反的具体清单项及其原因，并给出基于 Schema 证据的修正方向；若 PASS：留空"
+}}
+"""
+
+
+SQL_RETRY_FEEDBACK_TEMPLATE = """{question}
+
+=========================================
+❌ REVIEWER CRITIQUE (MUST FIX)
+=========================================
+Your previous SQL was rejected by the reviewer.
+Feedback: {feedback}
+
+👉 INSTRUCTION: Fix the SQL based on the critique above. Do NOT repeat the same mistake.
+"""

@@ -25,59 +25,43 @@ class MatchHelper:
 
     @staticmethod
     def prepare_scan_phrases(value_kw: List[str], all_kw: List[str], hints: Any) -> List[str]:
-        phrases = set()  # 用 set 直接去重
+        """
+        修正版：严格隔离 CONCEPT。
+        只扫描被标记为 VALUE 的词。
+        ❌ 删除了所有针对 all_kw (CONCEPT) 的 Fallback 逻辑。
+        """
+        phrases = set()
 
-        # 1. Value Keywords (优先信任，但加一道防线)
+        # 1. 核心来源：只信任 value_kw (由 LLM 标记为 VALUE 的词)
         for v in value_kw:
             s = v.strip()
+            # 忽略太短的词 (防止把 'A', '1' 这种当做值去全库扫)
             if len(s) >= 2:
-                # 防御：如果是纯数字，且长度小于 6 (比如年份 2023, 分数 1500)，大概率是逻辑值，不扫
-                # 除非你确定你的 ID 都是短数字，否则这里建议保守
-                if s.isdigit() and len(s) < 6:
+                # 再次防御：如果是纯数字且太短，也不扫 (除非是 ID，这需要结合 hint，这里先保守)
+                if s.isdigit() and len(s) < 4:
                     continue
                 phrases.add(s)
 
-        # 2. Filter Hints (谨慎使用)
+        # 2. 辅助来源：Filter Hints (慎用)
+        # 只有当 hints 里不包含比较级操作符时，才认为是实体
         if hints and hints.filter_hints:
             for h in hints.filter_hints:
-                # 过滤掉明显的非实体 Hint (如 "score > 100", "K-12")
-                if h and not RE_GRADE_HINT.match(h) and not RE_AGE_RANGE.match(h):
-                    # 如果 Hint 包含比较符号，千万别当作值去搜！
-                    if any(op in h for op in [">", "<", "=", "over", "under", "above", "below"]):
-                        continue
-                    phrases.add(h.strip())
+                if not h: continue
+                # 过滤掉 "K-12", "Ages 5-17"
+                if RE_GRADE_HINT.match(h) or RE_AGE_RANGE.match(h): continue
 
-        # 3. Fallback from all keywords (补漏，但必须严格)
-        for w in all_kw:
-            wl = (w or "").strip()
-            if not wl: continue
+                # 🔥 关键防御：如果包含 > < = over under，说明是逻辑条件，不是值！
+                if any(op in h for op in [">", "<", "=", "over", "under", "above", "below"]):
+                    continue
 
-            # 过滤停用词、学段等
-            if wl.lower() in SCHEMA_STOP_WORDS or wl.lower() in CONCEPT_STOP_WORDS: continue
-            if RE_GRADE_HINT.match(wl) or RE_AGE_RANGE.match(wl): continue
+                phrases.add(h.strip())
 
-            # 🔥 修正后的逻辑：严禁纯数字！
-            # 1500 -> isdigit=True -> 拒绝
-            # 2023 -> isdigit=True -> 拒绝
-            # CDS-123 -> isdigit=False -> 允许
-            # Alameda -> isdigit=False -> 允许
-            if wl.isdigit():
-                continue
+        # 3. ❌ 原来的 Fallback 逻辑被彻底删除了 ❌
+        # 我们不再遍历 all_kw。
+        # 因为 all_kw 里的 "SAT", "Count", "School" 是用来找 Schema 的，
+        # 绝对不能进入这里的 phrases 列表！
 
-                # 之前的启发式保留，但前提是它不是纯数字
-            # 允许: 长度>=3 且 (有大写 或 有数字但不是纯数字)
-            # 例子: "iPhone" (有大写), "District9" (有数字)
-            if len(wl) >= 3 and (any(c.isupper() for c in wl) or any(c.isdigit() for c in wl)):
-                phrases.add(wl)
-
-        # 4. County variants (处理 Alameda County 这种)
-        final_list = list(phrases)
-        for p in list(phrases):  # copy current set to list to iterate
-            m = re.match(r"^\s*(.+?)\s+county\s*$", p, flags=re.IGNORECASE)
-            if m and len(m.group(1)) >= 3:
-                final_list.append(m.group(1))
-
-        return list(set(final_list))
+        return list(phrases)
 
     @staticmethod
     def select_best_matches(matches: List[Any], question: str, hints: Any) -> List[Any]:
