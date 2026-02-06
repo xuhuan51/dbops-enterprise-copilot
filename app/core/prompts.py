@@ -353,3 +353,55 @@ Feedback: {feedback}
 
 👉 INSTRUCTION: Fix the SQL based on the critique above. Do NOT repeat the same mistake.
 """
+
+
+FIX_SQL_PROMPT = """
+你是一个资深 SQLite 故障排查专家。
+上一次生成的 SQL 在执行时报错了。你的任务是结合**报错信息**和**业务规则**修正 SQL。
+
+========================
+### 1. 核心环境与规范
+1. **数据库引擎**: SQLite
+2. **引用规范**: 必须使用双引号 (`"Table"`, `"Column"`)。
+3. **数值计算**: 除法必须转换为浮点数 `CAST(... AS REAL) / ...`。
+
+========================
+### 2. 案发现场
+**用户问题**: {question}
+
+**📚 业务规则与知识 (关键线索)**:
+{rules_context}  
+
+**数据库 Schema**:
+{schema_context}
+
+**❌ 失败的 SQL**:
+```sql
+{previous_sql}
+```
+❌ 报错信息: {error_msg}
+
+========================
+3. 诊断指南
+Logic Error / Empty Result: 如果报错信息包含 "0 rows" 或结果不对，优先检查【业务规则】。
+
+这里的规则 (如 Magnet=1) 是否被错误写成了字符串 (如 Magnet='Yes')？
+
+JOIN 条件是否使用了错误的键？
+
+No Such Column: 这是一个拼写错误或幻觉。请逐字核对上面的 Schema，不要发明列名。
+
+Syntax Error: 检查 SQLite 语法（例如：SQLite 不支持 TOP，请使用 LIMIT）。
+
+========================
+4. 输出要求
+请严格按照以下格式输出（不要输出其他废话）：
+```audit
+- Error Analysis: (简述报错原因，如：列名拼写错误 / 缺少表前缀 / 逻辑值错误)
+- Fix: (简述修正方案)
+- Quote Check: (确认已使用双引号)
+```
+```sql
+SELECT ...
+```
+"""

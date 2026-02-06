@@ -1,24 +1,30 @@
 import asyncio
 import logging
+import sqlite3
+import os
+import pandas as pd
+from typing import List, Dict, Any, Set
 from dotenv import load_dotenv
 from app.core.state import AgentState
-# 🔥 核心：引入编译好的图 app
-from app.graph.graph import app
+from app.core.config import settings  # 需要读取 BIRD_DB_ROOT
+from app.graph.graph import app  # 引入编译好的图
 
-# 配置日志，让你能看到 Verification 的内部过程
+# ==========================================
+# 1. 日志配置 (保持清爽)
+# ==========================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-
-# 🔥🔥🔥 新增：强力屏蔽噪音 🔥🔥🔥
-# 屏蔽 HTTP 请求日志
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# 屏蔽 ChromaDB/SentenceTransformer 的进度条日志 (通常是 tqdm)
 logging.getLogger("chromadb").setLevel(logging.WARNING)
 logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("execution_node").setLevel(logging.INFO)  # 让我们看到执行节点的日志
 
+# ==========================================
+# 2. 测试数据集 (BIRD Dev Set Samples)
+# ==========================================
 BIRD_DATASET = [
     {
         "question_id": 6,
@@ -41,10 +47,67 @@ BIRD_DATASET = [
 ]
 
 
+# ==========================================
+# 3. 辅助工具：执行标准 SQL (Ground Truth)
+# ==========================================
+def execute_gold_sql(db_id: str, sql: str) -> List[Dict[str, Any]]:
+    """
+    手动执行标准答案 SQL，用于获取正确结果
+    """
+    db_path = os.path.join(settings.BIRD_DB_ROOT, db_id, f"{db_id}.sqlite")
+
+    if not os.path.exists(db_path):
+        print(f"❌ [Test Error] Gold DB not found: {db_path}")
+        return []
+
+    try:
+        # 只读模式连接
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        cursor.execute(sql)
+
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+
+        conn.close()
+        # 转为 List[Dict]
+        return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        print(f"❌ [Gold SQL Error]: {e}")
+        return []
+
+
+def normalize_result(result: List[Dict]) -> Set[tuple]:
+    """
+    结果标准化：忽略列名，只提取值的元组集合。
+    原因：生成的 SQL 列名可能叫 "Phone"，标准答案可能叫 "T2.Phone"，
+    但我们要比对的是【内容】是否一致。
+    """
+    if not result:
+        return set()
+
+    # 将字典的值提取出来，转为元组，再放入集合 (自动去重且忽略顺序)
+    # 注意：对于 ORDER BY LIMIT 1 的问题，集合比对也是有效的（因为只有一个元素）
+    # 对于严格排序问题，应该用 List 比对，但 Set 比对能覆盖 95% 场景
+    normalized = []
+    for row in result:
+        # 将所有值转为字符串处理，防止 int vs float 的细微差异
+        values = tuple(str(v).strip() for v in row.values())
+        normalized.append(values)
+
+    return set(normalized)
+
+
+# ==========================================
+# 4. 主测试逻辑
+# ==========================================
 async def run_graph_test():
     print(f"\n{'=' * 80}")
-    print(f"🚀 [LangGraph] BIRD 数据集全链路测试 (自动循环版)")
+    print(f"🚀 [LangGraph] BIRD 数据集执行精度测试 (Execution Accuracy)")
     print(f"{'=' * 80}\n")
+
+    pass_count = 0
+    total_count = len(BIRD_DATASET)
 
     for case in BIRD_DATASET:
         q_id = case.get("question_id")
@@ -63,41 +126,61 @@ async def run_graph_test():
         }
 
         try:
-            print("   ⏳ Graph is running... (请观察下方日志流)")
+            print("   ⏳ Agent Running... ", end="", flush=True)
 
-            # 🔥 这一句是关键！它启动了自动驾驶模式
+            # 1. 运行 Agent
             final_state = await app.ainvoke(inputs)
+            print("Done.")
 
-            print("✅ Done!")
+            # 2. 提取 Agent 结果
+            gen_sql = final_state.get("generated_sql", "N/A")
+            pred_result = final_state.get("execution_result")  # List[Dict]
+            exec_error = final_state.get("execution_error")
 
-            # 结果分析
-            gen_sql = final_state.get("generated_sql", "")
-            retry_count = final_state.get("retry_count", 0)
-            verified = final_state.get("verified", False)
-            feedback = final_state.get("feedback", "")
+            # 3. 运行 Gold SQL (获取真值)
+            gold_result = execute_gold_sql(db_id, gold_sql)
 
-            print(f"\n   📝 [执行报告]")
-            print(f"      🔄 重试次数: {retry_count}")
-            print(f"      🛡️ 最终验证: {'PASS' if verified else 'FAIL'}")
-            if not verified:
-                print(f"      👀 失败反馈: {feedback}")
-            print(f"      🤖 最终 SQL: \033[92m{gen_sql}\033[0m")
-            print(f"      🔑 标准 SQL: \033[93m{gold_sql}\033[0m")
+            # 4. 核心比对逻辑
+            # 我们比对的是【结果集的内容】，忽略列名差异
+            pred_set = normalize_result(pred_result)
+            gold_set = normalize_result(gold_result)
 
-            norm_gen = " ".join(gen_sql.lower().split())
-            norm_gold = " ".join(gold_sql.lower().split())
+            is_correct = (pred_set == gold_set) and (pred_result is not None)
 
-            if norm_gen == norm_gold:
-                print("      🎉 [Perfect Match]")
+            # 5. 输出报告
+            print(f"\n   📝 [对比报告]")
+
+            # SQL 对比
+            print(f"      🤖 Gen SQL: \033[90m{gen_sql}\033[0m")  # 灰色显示
+            print(f"      🔑 Gold SQL: \033[90m{gold_sql}\033[0m")
+
+            # 结果对比
+            if exec_error:
+                print(f"      ❌ 执行报错: \033[91m{exec_error}\033[0m")
             else:
-                print("      🤔 [Check Logic]")
+                # 只显示前 3 行结果，防止刷屏
+                print(f"      📊 Gen Result ({len(pred_set)} rows): {list(pred_set)[:3]}...")
+                print(f"      📊 Gold Result ({len(gold_set)} rows): {list(gold_set)[:3]}...")
+
+            # 最终判定
+            if is_correct:
+                print(f"      🎉 \033[92m[EXECUTION MATCH] 结果一致！\033[0m")
+                pass_count += 1
+            else:
+                print(f"      🚫 \033[91m[MISMATCH] 结果不一致\033[0m")
+                # 如果不一样，可以打印差异
+                diff = gold_set.symmetric_difference(pred_set)
+                if diff:
+                    print(f"         差异样本: {list(diff)[:3]}...")
 
         except Exception as e:
-            print(f"\n❌ Graph Execution Failed: {e}")
+            print(f"\n❌ System Failed: {e}")
             import traceback
             traceback.print_exc()
 
         print(f"\n{'-' * 80}\n")
+
+    print(f"🏆 测试结束: 准确率 {pass_count}/{total_count} ({(pass_count / total_count) * 100:.1f}%)")
 
 
 if __name__ == "__main__":
