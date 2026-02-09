@@ -4,9 +4,7 @@ import pickle
 import time
 import networkx as nx
 from typing import List, Dict, Optional
-
-from fsspec import json
-
+import json
 from app.core.config import settings
 from app.core.logger import logger
 

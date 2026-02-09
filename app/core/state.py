@@ -1,6 +1,6 @@
 # app/core/state.py
-
-from typing import List, Dict, Any, TypedDict, Literal, Optional
+import operator
+from typing import List, Dict, Any, TypedDict, Literal, Optional, Annotated
 from enum import Enum
 from pydantic import BaseModel, Field
 from langchain_core.messages import BaseMessage
@@ -100,6 +100,7 @@ class AgentState(TypedDict, total=False):
     final_sql: Optional[str]  # 清洗后实际执行的 SQL
     verified: bool  # Verifier 结果
     feedback: str  # Verifier 建议
+    feedback_history: Annotated[List[str], operator.add]  # 使用 operator.add 方便自动追加
 
     # 重试计数 (使用普通 int，由节点手动 state["retry_count"] += 1 控制)
     retry_count: int

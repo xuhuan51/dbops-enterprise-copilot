@@ -4,9 +4,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 import uvicorn
 
-from app.api.v1.agent_query import router as agent_router
-from app.api.v1.query import router as raw_sql_router
-from app.api.v1.analyze import router as analyze_router
 
 # 1. 引入 RAG 相关的单例 (Core 层)
 try:
@@ -59,10 +56,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="dbops-enterprise-copilot", lifespan=lifespan)
 
-# 注册路由
-app.include_router(agent_router, prefix="/api/v1")
-app.include_router(raw_sql_router, prefix="/api/v1")
-app.include_router(analyze_router, prefix="/api/v1")
+
 
 if HAS_RETRIEVE:
     app.include_router(retrieve_router, prefix="/api/v1")

@@ -27,22 +27,30 @@ logging.getLogger("execution_node").setLevel(logging.INFO)  # 让我们看到执
 # ==========================================
 BIRD_DATASET = [
     {
-        "question_id": 6,
+        "question_id": 10,
         "db_id": "california_schools",
-        "question": "Among the schools with the SAT test takers of over 500, please list the schools that are magnet schools or offer a magnet program.",
-        "SQL": "SELECT T2.School FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode WHERE T2.Magnet = 1 AND T1.NumTstTakr > 500",
+        "question": "For the school with the highest average score in Reading in the SAT test, what is its FRPM count for students aged 5-17?",
+        "evidence": "",
+        "SQL": "SELECT T2.`FRPM Count (Ages 5-17)` FROM satscores AS T1 INNER JOIN frpm AS T2 ON T1.cds = T2.CDSCode ORDER BY T1.AvgScrRead DESC LIMIT 1",
+        "difficulty": "simple"
     },
+
     {
-        "question_id": 7,
+        "question_id": 9,
         "db_id": "california_schools",
-        "question": "What is the phone number of the school that has the highest number of test takers with an SAT score of over 1500?",
-        "SQL": "SELECT T2.Phone FROM satscores AS T1 INNER JOIN schools AS T2 ON T1.cds = T2.CDSCode ORDER BY T1.NumGE1500 DESC LIMIT 1",
+        "question": "Among the schools with the average score in Math over 560 in the SAT test, how many schools are directly charter-funded?",
+        "evidence": "",
+        "SQL": "SELECT COUNT(T2.`School Code`) FROM satscores AS T1 INNER JOIN frpm AS T2 ON T1.cds = T2.CDSCode WHERE T1.AvgScrMath > 560 AND T2.`Charter Funding Type` = 'Directly funded'",
+        "difficulty": "simple"
     },
+
     {
-        "question_id": 8,
+        "question_id": 11,
         "db_id": "california_schools",
-        "question": "What is the number of SAT test takers of the schools with the highest FRPM count for K-12 students?",
-        "SQL": "SELECT NumTstTakr FROM satscores WHERE cds = ( SELECT CDSCode FROM frpm ORDER BY `FRPM Count (K-12)` DESC LIMIT 1 )",
+        "question": "Please list the codes of the schools with a total enrollment of over 500.",
+        "evidence": "Total enrollment can be represented by `Enrollment (K-12)` + `Enrollment (Ages 5-17)`",
+        "SQL": "SELECT T2.CDSCode FROM schools AS T1 INNER JOIN frpm AS T2 ON T1.CDSCode = T2.CDSCode WHERE T2.`Enrollment (K-12)` + T2.`Enrollment (Ages 5-17)` > 500",
+        "difficulty": "simple"
     }
 ]
 

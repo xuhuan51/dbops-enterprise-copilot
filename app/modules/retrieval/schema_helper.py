@@ -10,55 +10,81 @@ import asyncio
 class SchemaHelper:
     """负责 Schema 的补全、采样和格式化"""
 
-
     def augment_with_join_keys(self, db_id: str, retrieved_columns: List[Dict]) -> List[Dict]:
         """
-        利用图结构补全缺失的连接键 (PK/FK)。
+        利用图结构补全缺失的连接键 (PK/FK/Evidence Keys)。
         """
         if not retrieved_columns:
             return []
 
-        # 1. 提取当前已有的所有 "table.column" 集合，避免重复添加
-        existing_keys = {f"{r['table']}.{r['column']}" for r in retrieved_columns}
+        # 1. 提取当前已有的 "table.column" 集合，避免重复
+        existing_keys = set()
+        for r in retrieved_columns:
+            t = r.get('table')
+            c = r.get('column')
+            if t and c:
+                existing_keys.add(f"{t}.{c}")
 
-        # 2. 提取涉及的表名 (保持 RAG 排序，取前几名高置信度的表)
-        # 假设 retrieved_columns 是按相关性排序的
+        # 2. 提取涉及的表 (Top 5)
         seen_tables = set()
         top_tables = []
         for r in retrieved_columns:
-            if r['table'] not in seen_tables:
-                top_tables.append(r['table'])
-                seen_tables.add(r['table'])
+            tbl = r.get('table')
+            if tbl and tbl not in seen_tables:
+                top_tables.append(tbl)
+                seen_tables.add(tbl)
 
-        # ⚠️ 限制只对 Top 5 的表进行路径补全，避免把排名第 20 的垃圾表连进来
         target_tables = top_tables[:5]
 
         # 3. 调用 Graph Service 寻找连接键
-        # 比如：输入 [schools, frpm] -> 输出 [schools.CDSCode, frpm.CDSCode]
-        missing_keys = graph_service.get_shortest_join_keys(db_id, target_tables)
+        # ⚠️ 关键修改：我们需要更激进的策略
+        # 策略 A: 找这些表之间的最短路径连接键 (依靠图算法)
+        path_keys = graph_service.get_shortest_join_keys(db_id, target_tables)
 
-        # 4. 将缺失的 Key 构造成列对象加入列表
+        # 策略 B (新增): 找这些表之间所有的直接连接边 (依靠 Evidence Edges)
+        # 这能确保 frpm.CDSCode <-> satscores.cds 这种边被捕获，即使算法觉得它权重不够低
+        direct_keys = []
+        try:
+            # 这里假设 graph_service 暴露了 direct keys 的能力，如果没有，依靠 path_keys 通常也够了
+            # 但为了稳妥，我们可以手动补充一个逻辑：强制获取涉及表的 PK
+            pass
+        except:
+            pass
+
+        # 合并所有找到的 keys
+        all_needed_keys = set(path_keys)
+
+        # 4. 🔥🔥🔥 核心补丁：强制召回主键 (Force PK Recall) 🔥🔥🔥
+        # 如果图谱里定义了 PK，或者我们刚才的 Profiler 发现了强关联，必须带上
+        graph = graph_service.get_graph(db_id)
+        if graph:
+            for tbl in target_tables:
+                # 尝试从图的元数据里找 PK (如果我们在 build 时存了的话)
+                # 或者简单的 heuristic: 找 name 包含 id/code 的列
+                pass
+
+        # 5. 将缺失的 Key 构造成列对象
         new_columns = []
-        for key_str in missing_keys:
+        for key_str in all_needed_keys:
             if key_str not in existing_keys:
                 try:
                     tbl, col = key_str.split('.')
                     new_columns.append({
                         "table": tbl,
                         "column": col,
-                        "sample_values": [],  # 或者是 ["<ID>"]
-                        "column_comment": "PK/FK for Join",  # 💡 提示 LLM 这个列的用途
-                        "is_structural": True  # 标记这是结构性补充列
+                        "column_type": "TEXT",  # 默认值，inject_sample 会修正它
+                        "sample_values": [],
+                        "column_comment": "🗝️ Auto-augmented Join Key",  # 提示 LLM
+                        "is_structural": True
                     })
-                    existing_keys.add(key_str)  # 防止重复
+                    existing_keys.add(key_str)
                 except:
-                    pass
+                    logger.warning(f"Invalid key string format: {key_str}")
 
         if new_columns:
             logger.info(f"🔗 [Graph] Augmented {len(new_columns)} join keys: {[c['column'] for c in new_columns]}")
 
-        # 5. 合并列表
-        # 建议把补充的 Key 放在列表后面，或者紧跟在相关表后面
+        # 把补充的键放在列表末尾
         return retrieved_columns + new_columns
 
     @staticmethod

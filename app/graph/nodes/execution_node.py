@@ -12,6 +12,9 @@ from app.core.state import AgentState
 # 设置日志
 logger = logging.getLogger("execution_node")
 
+# 🔥 定义执行节点的最大重试次数 (与反思节点的重试区分开)
+MAX_EXECUTION_RETRIES = 1
+
 
 def is_read_only_sql(sql: str) -> bool:
     """
@@ -21,17 +24,14 @@ def is_read_only_sql(sql: str) -> bool:
     if not sql:
         return False
 
-    # 1. 移除注释 (防止 -- DELETE 绕过)
-    # 移除 -- 注释 和 /* */ 注释
+    # 1. 移除注释
     sql_clean = re.sub(r'(--[^\n]*)|(/\*.*?\*/)', '', sql, flags=re.DOTALL).strip()
 
     # 2. 必须以安全关键字开头
-    # BIRD 数据集主要是 SELECT 或 WITH (CTE)
     if not re.match(r'^(SELECT|WITH|PRAGMA|VALUES)', sql_clean, re.IGNORECASE):
         return False
 
     # 3. 黑名单关键字检查
-    # 使用单词边界 \b 防止误杀列名 (例如 select_update_time 是合法的)
     forbidden_patterns = [
         r'\bINSERT\b', r'\bUPDATE\b', r'\bDELETE\b', r'\bDROP\b',
         r'\bALTER\b', r'\bCREATE\b', r'\bTRUNCATE\b', r'\bGRANT\b',
@@ -49,15 +49,28 @@ def is_read_only_sql(sql: str) -> bool:
 def execution_node(state: AgentState) -> Dict[str, Any]:
     """
     执行节点：连接 BIRD SQLite 数据库并执行 SQL。
-    包含双重安全防御：正则检查 + 数据库只读模式。
+    包含双重安全防御 + 独立的重试计数器控制。
     """
     logger.info("🚀 [Execution Node] Start...")
 
     db_id = state.get("db_id")
     raw_sql = state.get("generated_sql", "")
 
-    # 1. SQL 清洗 (去除 Markdown 标记)
+    # 🔥 获取当前的执行重试次数 (默认为 0)
+    current_retries = state.get("execution_retries", 0)
+
+    # 1. SQL 清洗
     sql = raw_sql.replace('```sql', '').replace('```', '').strip().rstrip(';')
+
+    # 定义统一的返回结构 helper
+    def build_response(result=None, error=None, executable=False, retries=0):
+        return {
+            "execution_result": result,
+            "execution_error": error,
+            "is_executable": executable,
+            "final_sql": sql,
+            "execution_retries": retries  # ✅ 更新状态中的计数器
+        }
 
     # -------------------------------------------------------
     # 🛡️ 防御层 1: 语法白名单检查
@@ -65,62 +78,50 @@ def execution_node(state: AgentState) -> Dict[str, Any]:
     if not is_read_only_sql(sql):
         error_msg = "🚫 [Security Block] SQL blocked because it implies data modification or unsafe operations."
         logger.warning(f"{error_msg} SQL: {sql}")
-        return {
-            "execution_result": None,
-            "execution_error": error_msg,
-            "is_executable": False,
-            "final_sql": sql
-        }
+        # 安全拦截视为不可恢复错误，不建议重试，或者由 Router 决定
+        return build_response(error=error_msg, executable=False, retries=current_retries)
 
     # 2. 路径构建
-    # BIRD 结构: settings.BIRD_DB_ROOT / {db_id} / {db_id}.sqlite
     if not db_id:
-        return {"execution_error": "Missing db_id in state", "is_executable": False}
+        return build_response(error="Missing db_id in state", executable=False, retries=current_retries)
 
     db_path = os.path.join(settings.BIRD_DB_ROOT, db_id, f"{db_id}.sqlite")
 
     if not os.path.exists(db_path):
         error_msg = f"❌ Database file not found at: {db_path}"
         logger.error(error_msg)
-        return {
-            "execution_result": None,
-            "execution_error": error_msg,
-            "is_executable": False,
-            "final_sql": sql
-        }
+        return build_response(error=error_msg, executable=False, retries=current_retries)
 
     conn = None
-    result_data = None
     execution_error = None
+    result_data = None
 
     try:
         # -------------------------------------------------------
         # 🛡️ 防御层 2: 驱动级只读模式 (Hard Guard)
         # -------------------------------------------------------
-        # 使用 URI 模式 ?mode=ro 强制只读
-        # check_same_thread=False 允许 LangGraph 在不同线程中运行
         db_uri = f"file:{os.path.abspath(db_path)}?mode=ro"
         conn = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
-
         cursor = conn.cursor()
 
         # 执行 SQL
         cursor.execute(sql)
 
-        # 获取列名
-        columns = [description[0] for description in cursor.description]
-
-        # 获取数据 (限制行数，防止内存爆炸)
-        rows = cursor.fetchmany(settings.RESULT_MAX_ROWS)
-
-        # 转换为 List[Dict] 格式
-        result_data = [dict(zip(columns, row)) for row in rows]
+        # 获取列名和数据
+        if cursor.description:
+            columns = [description[0] for description in cursor.description]
+            rows = cursor.fetchmany(settings.RESULT_MAX_ROWS)
+            result_data = [dict(zip(columns, row)) for row in rows]
+        else:
+            result_data = []  # 处理非查询语句（虽然被过滤了，防万一）
 
         row_count = len(result_data)
         logger.info(f"✅ [Execution] Success. Retrieved {row_count} rows.")
 
+        # ✅ 成功：重置重试计数器为 0
+        return build_response(result=result_data, executable=True, retries=0)
+
     except sqlite3.OperationalError as e:
-        # 专门捕获只读模式拦截的写操作
         if "readonly" in str(e).lower():
             execution_error = "🔒 [Security Block] Database rejected write operation (ReadOnly Mode)."
         else:
@@ -135,10 +136,18 @@ def execution_node(state: AgentState) -> Dict[str, Any]:
         if conn:
             conn.close()
 
-    # 3. 返回更新后的状态
-    return {
-        "execution_result": result_data,
-        "execution_error": execution_error,
-        "is_executable": execution_error is None,  # 没有报错才算 True
-        "final_sql": sql  # 记录实际执行的 SQL (去除了 markdown 的)
-    }
+    # =======================================================
+    # 🔥 失败处理逻辑：判断是否允许重试
+    # =======================================================
+
+    # 计数器 +1
+    next_retries = current_retries + 1
+
+    if next_retries > MAX_EXECUTION_RETRIES:
+        logger.error(f"🛑 [Execution] Max retries ({MAX_EXECUTION_RETRIES}) reached. No more repairs.")
+        # 这里你可以选择给 error 加个前缀，让 Router 识别这是终极失败
+        # 或者 Router 只需要检查 state['execution_retries'] > 1 即可决定是否结束
+    else:
+        logger.warning(f"🔄 [Execution] Failed. Attempt {next_retries}/{MAX_EXECUTION_RETRIES}. Triggering Repair...")
+
+    return build_response(error=execution_error, executable=False, retries=next_retries)

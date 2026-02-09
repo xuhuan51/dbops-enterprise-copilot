@@ -294,64 +294,131 @@ SELECT ...
 ========================
 """
 
-
 SQL_REFLECTION_PROMPT = r"""
 你是一名**理性且具备高级逻辑的 SQL 审查员（SQL Reviewer）**。
 任务：判断 SQL 是否在当前 Schema 和业务规则约束下，**准确、简洁**地回答了用户问题。
 
 ======================
+1. 🆕 核心审查对象：当前 SQL (CURRENT SQL)
+======================
+{sql}
+
+======================
+2. 用户问题
+======================
+{question}
+
+======================
+3. 历史反馈 (仅供参考，若 SQL 已修复则忽略)
+======================
+{history_context}
+
+======================
+4. 审查依据 (Schema & Rules)
+======================
+Schema 证据：
+{schema_context}
+
+业务规则：
+{business_rules}
+
+======================
 核心审查原则
 ======================
-1. **语义映射优先**：若业务规则（business_rules）已将术语 A 映射为列 B，SQL 只要正确使用了列 B，即视为满足条件。
-2. **禁止样本幻觉**：Schema 中的 Samples 仅供参考类型。除非业务规则明确要求进行模糊搜索，否则禁止根据样本内容建议额外的字符串匹配（如 LIKE）。
-3. **最小代价原则**：只要 SQL 逻辑能产生正确结果且符合规则，必须 PASS。不要因为“不够严谨”或“写法风格”而 Fail。
+1. **语义映射优先**：若业务规则已将术语映射为列，SQL 正确使用该列即视为合规。
+2. **禁止样本幻觉**：除非明确要求模糊搜索，否则禁止根据样本内容建议 LIKE 操作。
+3. **最小代价原则**：只要 SQL 能产生正确结果，不要因为“写法风格”而 Fail。
+4. **语义封装优先 (New)**：如果一个“专有列”能同时表达多个条件（如 "Charter Funding Type" 同时包含 Charter 和 Funding 信息），优先认可该列，而不是强迫 SQL 使用 `AND` 拆分逻辑。
 
 ======================
-输入上下文
-======================
-- 用户问题：{question}
-- 生成 SQL：{sql}
-- Schema 证据：{schema_context}
-- 业务知识/指标定义：{business_rules}
-
-======================
-硬性审查清单（Fail-fast）
+硬性审查清单（必须检查所有项）
 ======================
 
-1) 🚨 指标与术语一致性 (Consistency)
-- **语义覆盖**：检查 business_rules 是否有预定义指标。若“条件 X”对应“列 Y”，严禁要求对列 Y 进行字面量过滤（如已知 NumGE1500 代表分数达标人数，则不应再要求 score > 1500）。
-- **字段确定性**：SQL 必须且只能使用 schema_context 中明确存在的表和列。
+1) 🚨 事实与规则的优先级裁决 (Schema Evidence vs. Business Rules)
+   - **Schema 事实绝对优先**：如果【业务规则】强制要求使用“列 A”，但 SQL 使用了【Schema】中存在的“列 B”，且“列 B”在语义上能更精准、更直接地回答用户问题（例如：列 B 是一个专有的复合字段，而列 A 是通用字段），**请判定为 PASS**。严禁教条地因为“没用规则指定的列”而报错。
+   - **样本值权威性**：如果【业务规则】声称字段值应为某种格式（如全大写），但【Schema 样本】显示实际存储的是另一种格式（如小写或首字母大写），**请以 Schema 样本为准**。数据库里的真实数据是最高真理。
+   - **语义覆盖**：若 SQL 使用的列能够覆盖问题的语义，严禁要求对该列进行不必要的字面量拆分或死板过滤。
+   - **字段确定性**：必须且只能使用 schema_context 中存在的列。
 
 2) 🚨 过滤逻辑完备性 (Filter Completeness)
-- **显式条件**：用户问题中提到的显式时间、地点、类别等限定词，SQL 必须有对应的过滤逻辑。
-- **关联准确性**：多表查询必须使用正确的主外键（如 CDSCode）进行 JOIN，严禁产生笛卡尔积。
+   - **显式条件**：用户问题中的显式限定词，SQL 必须有对应的逻辑。
+   - **语义封装豁免 (Semantic Encapsulation)**：如果 SQL 使用了一个“专有列”或“复合列”，该列的命名或定义已经能够完整涵盖用户问题中的多个限定词（例如：一个列名同时包含了“类型”和“状态”两个概念），则**不需要**再为每个词单独添加过滤条件。不要因为 SQL 看起来“少了一个条件”就报错，要看该列的语义是否已包含这些概念。
+   - **关联准确性**：必须使用正确的主外键进行 JOIN。
 
 3) 🚨 极值与唯一性 (Top-K / Uniqueness)
-- **排序语义**：对于“最高/最少/第一名”等语义，必须包含 `ORDER BY`。
-- **单实体提取**：对于返回单个实体的请求，使用 `ORDER BY ... LIMIT 1` 是标准且合法的实现方式，不应因此 Fail。
+   - 涉及“最高/最少/排序”必须有 `ORDER BY`。
 
 4) 🚨 数量 vs 比例 (Metric Alignment)
-- **统计口径**：问“数量/多少”必须返回计数值（COUNT/SUM）；问“比例/率”才允许使用除法。
+   - 问“数量”用 COUNT，问“比例”用除法。
+
+5) 🚨 历史与事实核查 (History & Fact Check)
+   - **视觉事实核查**：在提出批评之前，请先用“肉眼”扫描一遍 **当前 SQL**。如果 Generator 已经修复了历史指出的错误（例如已经加了 JOIN，或者已经改了列名），**严禁**盲目重复旧的批评！
+   - **冲突裁决**：若【历史建议】与【Schema 证据】（如列名是否存在、样本值格式）冲突，**以 Schema 证据为准**。
+   - **禁止摇摆**：避免“上一轮说 A，这一轮改回 B”的反复折磨。如果当前 SQL 在逻辑上是通的，且符合 Schema 事实，就让它过。
 
 ======================
-输出（严格 JSON，无多余文字）
+输出（严格 JSON）
 ======================
+请检查上述所有清单项。如果发现多个错误，请在 feedback 中汇总列出。
 {{
   "status": "PASS" 或 "FAIL",
-  "feedback": "若 FAIL：指出违反的具体清单项及其原因，并给出基于 Schema 证据的修正方向；若 PASS：留空"
+  "feedback": "若 FAIL：请按顺序通过序号列出**所有**发现的问题。注意：如果发现 SQL 用了多个 AND 条件来拼凑一个概念，而 Schema 中有更具体的专有列，请明确建议更换为该专有列（例如：'建议使用 frpm.Charter Funding Type 替换 schools.FundingType'）。"
 }}
 """
 
 
-SQL_RETRY_FEEDBACK_TEMPLATE = """{question}
+SQL_REPAIR_PROMPT = """
+你是一名资深 SQLite 修复专家。你的任务是根据**审查反馈**或**执行报错**，修正有问题的 SQL。
 
-=========================================
-❌ REVIEWER CRITIQUE (MUST FIX)
-=========================================
-Your previous SQL was rejected by the reviewer.
-Feedback: {feedback}
+### 1. 🎯 修复目标
+**用户问题**: {question}
 
-👉 INSTRUCTION: Fix the SQL based on the critique above. Do NOT repeat the same mistake.
+### 2. 🗺️ 数据标准 (Schema & Rules)
+**Database Schema**:
+{schema_context}
+
+**关键业务规则**:
+{rules_context}
+
+### 3. 🚫 案发现场 (Bad SQL & Feedback)
+**❌ 之前生成的错误 SQL**:
+```sql
+{previous_sql}
+```
+🔥 必须修正的错误 (CRITICAL FEEDBACK): {error_msg}
+
+4. 🛠️ 修复指令 (Strict Instructions)
+Focus on the Error: 所有的修改必须直接针对上面的 {error_msg}。
+如果反馈说 "JOIN 错了"，就只改 JOIN 条件。
+
+如果反馈说 "列名不存在"，就查 Schema 修正拼写。
+
+如果反馈说 "逻辑不对"，请重新思考 WHERE 条件。
+
+Hard Rules:
+
+保持 SQLite 语法。
+
+必须使用 双引号 引用所有表名和列名 ("Table"."Column")。
+
+如果涉及除法，保持 CAST(... AS REAL)。
+
+No Hallucination: 绝对不要使用 Schema 中不存在的列。
+
+5. ✅ 输出要求
+请直接输出修复后的内容，不要输出任何寒暄，格式如下：
+
+代码段
+```audit
+- Error Source: (引用上面的错误信息，例如 "使用了错误的 JOIN 键 District Code")
+- Fix Strategy: (一步说明你怎么改的，例如 "改为使用 CDSCode 进行关联")
+- History Alignment: (一句话说明你如何与历史记录保持一致/如何裁决冲突)
+```
+
+SQL
+```sql
+SELECT ...
+```
 """
 
 
@@ -405,3 +472,5 @@ Syntax Error: 检查 SQLite 语法（例如：SQLite 不支持 TOP，请使用 L
 SELECT ...
 ```
 """
+
+

@@ -8,16 +8,14 @@ from app.core.llm import get_llm
 from app.core.state import AgentState
 from app.core.logger import logger
 
-# 🔥 导入两个 Prompt：一个是正常生成，一个是修 Bug
-from app.core.prompts import (
-    GEN_SQL_PROMPT,
-    SQL_RETRY_FEEDBACK_TEMPLATE,
-    FIX_SQL_PROMPT  # <--- ✅ 新增这个导入
-)
+# 🔥 核心：导入两个 Prompt
+# GEN_SQL_PROMPT: 用于第一次从零生成 (重型)
+# SQL_REPAIR_PROMPT: 用于根据报错或反馈进行修复 (轻型)
+from app.core.prompts import GEN_SQL_PROMPT, SQL_REPAIR_PROMPT
 
 
 # ==============================================================================
-# 🛠️ 辅助函数 (保持不变)
+# 🛠️ 辅助函数
 # ==============================================================================
 
 def _format_history(history: List[Any]) -> str:
@@ -44,27 +42,26 @@ def _dedup_keep_order(items: List[str], limit: int | None = None) -> List[str]:
 
 
 # ==============================================================================
-# 🚀 核心生成节点
+# 🚀 核心生成节点 (Final Ultimate Version)
 # ==============================================================================
 
 async def generate_node(state: AgentState) -> Dict[str, Any]:
     """
-    Generator Node (Ultimate Version)
-    策略优先级:
-    1. 🚑 ICU 模式: 如果有 execution_error，优先使用 FIX_SQL_PROMPT 进行修复。
-    2. 🔄 反馈模式: 如果 verified=False，使用带 Feedback 的 Prompt 重试。
-    3. 🆕 正常模式: 初次生成。
+    Generator Node
+    策略逻辑：
+    1. 判断是否存在错误来源 (Execution Error 或 Verifier Feedback)。
+    2. 如果有错且有旧代码 -> 进入 [Repair Mode] (使用 SQL_REPAIR_PROMPT)。
+    3. 否则 -> 进入 [Normal Mode] (使用 GEN_SQL_PROMPT)。
     """
     # --- 1. 获取 State ---
     question = state.get("question", "")
     history = state.get("history", [])
 
     # 状态标志
-    execution_error = state.get("execution_error")  # SQLite 报错信息
-    generated_sql = state.get("generated_sql")  # 上一次生成的 SQL (用于修复)
-
-    feedback = state.get("feedback", "")  # Verifier 的反馈
-    verified = state.get("verified", True)
+    execution_error = state.get("execution_error")  # SQLite 报错
+    generated_sql = state.get("generated_sql")  # 旧 SQL
+    feedback = state.get("feedback", "")  # Verifier 反馈
+    verified = state.get("verified", True)  # 验证状态
 
     retry_count = state.get("retry_count", 0)
 
@@ -79,10 +76,11 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
     history_context = _format_history(history) if history else ""
 
     # ----------------------------------------------------
-    # A. 约束处理 (Logic Flattening) - 无论是生成还是修复都需要
+    # A. 上下文组装 (Logic Flattening)
     # ----------------------------------------------------
+    # 即使是修复模式，也需要 Rules 和 Schema，所以先组装好
 
-    # ... (这部分逻辑保持不变，构建 constraints_str 和 rules_str) ...
+    # 1. 处理 Value Matches (Hard Filters & Hints)
     hard_filters: List[str] = []
     soft_hints: List[str] = []
     if value_matches:
@@ -94,18 +92,15 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
             else:
                 soft_hints.append(s)
 
+    # 2. 处理 Business Rules
     general_rules: List[str] = []
     if business_rules:
         for r in business_rules:
             txt = r.get("content") if isinstance(r, dict) else str(r)
             if txt.strip(): general_rules.append(txt.strip())
 
-    # Constraints String
-    constraints_str = "No specific mandatory filters."
-    if hard_filters:
-        constraints_str = "\n".join([f"🔴 FILTER: {c}" for c in hard_filters])
-
-    # Rules String
+    # 构建 rules_str (包含业务规则和值匹配提示)
+    # 这对修复模式至关重要，防止修好了语法但丢了业务逻辑
     rules_blocks = []
     if general_rules:
         rules_blocks.extend([f"- 💡 {r}" for r in general_rules])
@@ -116,13 +111,18 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
             rules_blocks.extend([f"- {h}" for h in deduped_hints])
     rules_str = "\n".join(rules_blocks) if rules_blocks else "No additional business rules."
 
-    # Join Paths String
+    # 构建 constraints_str (仅用于 Normal Mode)
+    constraints_str = "No specific mandatory filters."
+    if hard_filters:
+        constraints_str = "\n".join([f"🔴 FILTER: {c}" for c in hard_filters])
+
+    # 构建 join_paths_str (仅用于 Normal Mode)
     paths_context = "No specific join paths provided."
     if join_paths:
         paths = [str(p) for p in join_paths]
         paths_context = "\n".join(paths[:5])
 
-    # Few Shot String
+    # 构建 few_shot_str (仅用于 Normal Mode)
     few_shot_str = "No few-shot examples available."
     if few_shot_examples:
         ex_lines = []
@@ -134,57 +134,43 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
         few_shot_str = "\n".join(ex_lines)
 
     # ----------------------------------------------------
-    # 🔥 B. 策略分流 (核心修改)
+    # 🔥 B. 策略分流 (核心逻辑)
     # ----------------------------------------------------
 
     llm = get_llm(model_name=settings.LLM_MODEL)
     final_prompt = ""
     mode_log = ""
 
-    # 🛑 优先级 1: 执行报错修复 (ICU Mode)
-    # 条件: 存在报错信息 + 存在旧 SQL
-    if execution_error and generated_sql:
-        mode_log = "🚑 [ICU Mode] Fixing Execution Error"
-        logger.warning(f"{mode_log}: {execution_error[:100]}...")
-
-        # 使用 FIX_SQL_PROMPT
-        # 注意: 这里我们要把 rules_str 也传进去，辅助诊断
-        final_prompt = FIX_SQL_PROMPT.format(
-            question=question,
-            schema_context=schema_str,
-            rules_context=rules_str,  # 关键：带上规则，防止修好了语法丢了业务逻辑
-            previous_sql=generated_sql,
-            error_msg=execution_error
-        )
-
-    # 🔄 优先级 2: 验证反馈重试 (Feedback Mode)
-    # 条件: verified=False + 存在反馈建议
+    # 确定当前的“错误信息” (Execution Error 优先级高于 Feedback)
+    current_error = None
+    if execution_error:
+        current_error = f"Execution Failed: {execution_error}"
     elif not verified and feedback:
-        mode_log = "🔄 [Feedback Mode] Retrying with Verifier Feedback"
-        logger.info(f"{mode_log}: {feedback[:100]}...")
+        current_error = f"Verifier Critique: {feedback}"
 
-        # 构造带反馈的问题
-        final_question_prompt = SQL_RETRY_FEEDBACK_TEMPLATE.format(
+    # 🚦 分支判断
+
+    # 【模式 A：统一修复模式 (Repair Mode)】
+    # 条件：(有报错 OR 有反馈) AND 有旧代码
+    if current_error and generated_sql:
+
+        # 使用轻量级的 SQL_REPAIR_PROMPT
+        # 它可以让 LLM 聚焦于 Schema、错误信息和旧代码，避免被 Few-Shot 干扰
+        final_prompt = SQL_REPAIR_PROMPT.format(
             question=question,
-            feedback=feedback
-        )
-
-        # 使用通用 Prompt，但 Question 变了
-        final_prompt = GEN_SQL_PROMPT.format(
-            history_context=history_context,
             schema_context=schema_str,
-            constraints_context=constraints_str,
-            rules_context=rules_str,
-            join_paths_context=paths_context,
-            few_shot_context=few_shot_str,
-            question=final_question_prompt
+            rules_context=rules_str,  # 带上规则，确保逻辑正确
+            previous_sql=generated_sql,
+            error_msg=current_error  # 无论是报错还是骂声，都填这里
         )
 
-    # 🆕 优先级 3: 正常生成 (Normal Mode)
+    # 【模式 B：从零生成模式 (Creation Mode)】
+    # 条件：第一次生成 OR 之前没有旧代码
     else:
-        mode_log = "🎨 [Normal Mode] First Generation"
+        mode_log = "🎨 [Normal Mode] Generating from scratch..."
         logger.info(mode_log)
 
+        # 使用重型的 GEN_SQL_PROMPT
         final_prompt = GEN_SQL_PROMPT.format(
             history_context=history_context,
             schema_context=schema_str,
@@ -207,7 +193,7 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
         response = await llm.ainvoke(messages)
         content = response.content
 
-        # 解析 (复用相同的解析逻辑，因为我们统一了 Prompt 的输出格式要求)
+        # 解析逻辑 (统一处理)
         sql = ""
         thought = ""
 
@@ -216,6 +202,7 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
         if sql_match:
             sql = sql_match.group(1).strip()
         else:
+            # 兜底
             clean_text = content.replace("```sql", "").replace("```", "").strip()
             if "SELECT" in clean_text.upper():
                 sql = clean_text
@@ -230,7 +217,7 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
         if final_sql and not final_sql.endswith(";"):
             final_sql += ";"
 
-        logger.info(f"📝 [Generator] SQL Generated: {final_sql[:50]}...")
+        logger.info(f"📝 [Generator] SQL Generated: {final_sql}")
 
         # ----------------------------------------------------
         # D. 更新 State
@@ -239,14 +226,12 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
             "generated_sql": final_sql,
             "generated_thought": thought,
             "final_answer": final_sql,
-
-            # 🔥 关键：增加重试计数
-            "retry_count": retry_count + 1,
-
-            # 🔥 关键：清空之前的报错信息！
-            # 否则 Router 会一直以为处于报错状态，导致死循环
+            # 🔥 关键：清空之前的报错信息，重置状态
+            # 如果这轮生成的 SQL 还有错，Verifier 或 Executor 会再次把这两个字段填上
             "execution_error": None,
-            "is_executable": None
+            "is_executable": None,
+            # 注意：verified 状态会在 verification_node 更新，这里不需要强制设为 True，
+            # 但通常生成新 SQL 后，我们假设它需要重新验证。
         }
 
     except Exception as e:

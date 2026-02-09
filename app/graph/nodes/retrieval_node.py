@@ -9,7 +9,7 @@ from app.core.logger import logger
 def _format_schema_context(retrieved_columns: List[Dict[str, Any]]) -> str:
     """
     将检索到的零散列信息，格式化为 LLM 易读的 Schema 字符串。
-    (已修复：增加样本值 Sample Values 的显示)
+    🔥🔥🔥 关键修复：显式增加 PK (主键) 和 FK (外键) 标记，防止 LLM 乱连表 🔥🔥🔥
     """
     if not retrieved_columns:
         return "No relevant schema found."
@@ -21,17 +21,38 @@ def _format_schema_context(retrieved_columns: List[Dict[str, Any]]) -> str:
         c_name = col.get("column")
         desc = col.get("desc", "No description")
 
-        # 尝试获取样本值，优先取 'sample_values'，没有则取 'samples'
+        # --- [A] 提取样本值 ---
         samples = col.get("sample_values") or col.get("samples", [])
-
         sample_str = ""
         if samples:
-            # 限制一下数量（只显示前 15 个给 LLM），防止 Token 爆炸
+            # 限制显示数量，防止 Token 爆炸
             formatted_vals = ", ".join([repr(x) for x in samples[:15]])
             sample_str = f" | Values: {formatted_vals}"
 
-        # 格式：column_name (Description...) | Values: ...
-        col_str = f"- {c_name} (Description: {desc}){sample_str}"
+        # --- [B] 🔥 提取主键信息 ---
+        pk_mark = ""
+        if col.get("is_primary_key") or col.get("is_pk"):
+            pk_mark = " [PK]"
+
+        # --- [C] 🔥🔥🔥 提取外键信息 (最关键的一步) ---
+        fk_mark = ""
+        # 兼容 fk_to 可能是列表 [{"table":..., "column":...}] 的情况
+        fk_info = col.get("fk_to")
+        if fk_info:
+            try:
+                if isinstance(fk_info, list):
+                    # 格式化为: [FK -> table.col, table2.col2]
+                    refs = [f"{item['table']}.{item['column']}" for item in fk_info if 'table' in item]
+                    if refs:
+                        fk_mark = f" [FK -> {', '.join(refs)}]"
+                elif isinstance(fk_info, dict):
+                    fk_mark = f" [FK -> {fk_info.get('table')}.{fk_info.get('column')}]"
+            except Exception:
+                pass  # 防止格式异常导致崩溃
+
+        # --- [D] 组合最终字符串 ---
+        # 格式：- col_name [PK] [FK -> target] (Description) | Values
+        col_str = f"- {c_name}{pk_mark}{fk_mark} (Description: {desc}){sample_str}"
         tables[t_name].append(col_str)
 
     # 2. 拼接字符串
@@ -44,11 +65,15 @@ def _format_schema_context(retrieved_columns: List[Dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
-# 🔥🔥🔥 修改点 1：增加 rules 参数 🔥🔥🔥
+# ... (保持你的 _log_retrieval_details 不变，那个写得很好) ...
 def _log_retrieval_details(cols: List[Dict], matches: List[str], schema_len: int, rules: List[Any] = None):
     """
     专门负责打印漂亮的调试日志 (高颜值版 ✨ + 知识库)
     """
+    # ... (你的原代码) ...
+    # 略：为了节省篇幅，这里假设你保留了原有的 _log_retrieval_details 代码
+    # 只需确保 matches 循环里的 .format_constraint() 判断逻辑存在即可
+    # ...
     # 1. 标题
     log_msg = ["\n" + "=" * 60]
     log_msg.append(f"🔍 [Retrieval Debug Info] (Found {len(cols)} columns)")
@@ -120,7 +145,7 @@ def _log_retrieval_details(cols: List[Dict], matches: List[str], schema_len: int
     log_msg.append("=" * 60 + "\n")
 
     # 一次性输出
-    print("\n".join(log_msg))
+    logger.info("\n".join(log_msg))  # 这里建议用 logger 输出
 
 
 async def retrieval_node(state: AgentState) -> Dict[str, Any]:
@@ -156,16 +181,17 @@ async def retrieval_node(state: AgentState) -> Dict[str, Any]:
         value_matches = context.get("value_matches", [])
 
         # 4. 准备 Schema String
+        # 优先使用 orchestrator 生成的，如果没有则自己生成
         schema_str = context.get("schema_str")
         if not schema_str:
             schema_str = _format_schema_context(retrieved_cols)
 
-        # 🔥🔥🔥 修改点 3：把 rules 传给日志函数 🔥🔥🔥
+        # 5. 打印日志
         _log_retrieval_details(retrieved_cols, value_matches, len(schema_str), rules)
 
         logger.info(f"✅ [Retrieval Node] Done. Found {len(retrieved_tables)} tables.")
 
-        # 5. 更新 State
+        # 6. 更新 State
         return {
             "retrieved_tables": retrieved_tables,
             "retrieved_columns": retrieved_cols,

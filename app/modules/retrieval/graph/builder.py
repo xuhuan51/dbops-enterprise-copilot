@@ -31,7 +31,7 @@ class SchemaGraphBuilder:
 
         self._group_by_db()
 
-        self.evidence_dir = os.path.join("../data/bird/metadata/evidence_joins")
+        self.evidence_dir = os.path.join("../../../../data/bird/metadata/evidence_joins")
 
         # 脏词表 (仅对非 Key 列生效)
         self.ignore_substrings = {
