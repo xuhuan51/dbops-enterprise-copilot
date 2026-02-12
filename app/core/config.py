@@ -18,12 +18,16 @@ load_dotenv(os.path.join(project_root, ".env"))
 
 class Settings:
     # =========================
-    # 📂 A. BIRD / SQLite 数据集配置 (新增核心)
+    # 💾 A. 物理数据库配置 (MySQL)
     # =========================
-    # 假设你的 BIRD 数据库文件夹解压在项目下的 data/bird/dev_databases
-    # 结构应该是: .../dev_databases/{db_id}/{db_id}.sqlite
-    BIRD_DB_ROOT = os.getenv("BIRD_DB_ROOT", os.path.join(project_root, "data", "bird", "dev_databases"))
-
+    # 在 Docker 中，如果你是在同一个 network 下，HOST 可以填 mysql-3306
+    DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+    DB_PORT = int(os.getenv("DB_PORT", "3306"))
+    DB_USER = os.getenv("DB_USER", "root")
+    # 这里的密码要和你 docker-compose.yml 里的 MYSQL_ROOT_PASSWORD 一致
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "2679622408")
+    # 这里的库名要和你 docker-compose.yml 里的 MYSQL_DATABASE 一致
+    DB_NAME = os.getenv("DB_NAME", "ecommerce")
     # 结果限制，防止 select * from big_table 撑爆内存
     RESULT_MAX_ROWS = int(os.getenv("RESULT_MAX_ROWS", "50"))
 

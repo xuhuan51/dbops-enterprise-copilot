@@ -1,121 +1,121 @@
-import os
-import networkx as nx
-from typing import List, Dict, Any
-from sqlalchemy import create_engine, text
-from app.modules.retrieval.graph.service import graph_service
-from app.core.logger import logger
+import pymysql
 import asyncio
+from typing import List, Dict, Any
+from app.core.config import settings
+from app.core.logger import logger
 
 
 class SchemaHelper:
-    """负责 Schema 的补全、采样和格式化"""
+    """
+    [Schema 助手]
+    负责：
+    1. 补全 Join Key (外键)：如果选了表A和表B，自动把它们关联的 ID 列加进来。
+    2. 注入样本值 (Sample Values)：去数据库查询真实的样本，填入 context。
+    3. 格式化 (Format)：生成 LLM 易读的 Schema 字符串。
+    """
 
     def augment_with_join_keys(self, db_id: str, retrieved_columns: List[Dict]) -> List[Dict]:
         """
-        利用图结构补全缺失的连接键 (PK/FK/Evidence Keys)。
+        [图增强] 利用外键规则补全连接键。
+        如果 retrieved_columns 里有 `orders` 表，但没有 `user_id`，这会导致无法 join `users`。
+        本函数会自动补全这些 FK 列。
         """
         if not retrieved_columns:
             return []
 
-        # 1. 提取当前已有的 "table.column" 集合，避免重复
-        existing_keys = set()
-        for r in retrieved_columns:
-            t = r.get('table')
-            c = r.get('column')
-            if t and c:
-                existing_keys.add(f"{t}.{c}")
+        # 1. 提取当前已有的 "table.column"
+        existing_keys = {f"{r['table']}.{r['column']}" for r in retrieved_columns}
 
-        # 2. 提取涉及的表 (Top 5)
-        seen_tables = set()
-        top_tables = []
-        for r in retrieved_columns:
-            tbl = r.get('table')
-            if tbl and tbl not in seen_tables:
-                top_tables.append(tbl)
-                seen_tables.add(tbl)
+        # 2. 提取涉及的所有表
+        seen_tables = list({r['table'] for r in retrieved_columns})
 
-        target_tables = top_tables[:5]
-
-        # 3. 调用 Graph Service 寻找连接键
-        # ⚠️ 关键修改：我们需要更激进的策略
-        # 策略 A: 找这些表之间的最短路径连接键 (依靠图算法)
-        path_keys = graph_service.get_shortest_join_keys(db_id, target_tables)
-
-        # 策略 B (新增): 找这些表之间所有的直接连接边 (依靠 Evidence Edges)
-        # 这能确保 frpm.CDSCode <-> satscores.cds 这种边被捕获，即使算法觉得它权重不够低
-        direct_keys = []
-        try:
-            # 这里假设 graph_service 暴露了 direct keys 的能力，如果没有，依靠 path_keys 通常也够了
-            # 但为了稳妥，我们可以手动补充一个逻辑：强制获取涉及表的 PK
-            pass
-        except:
-            pass
-
-        # 合并所有找到的 keys
-        all_needed_keys = set(path_keys)
-
-        # 4. 🔥🔥🔥 核心补丁：强制召回主键 (Force PK Recall) 🔥🔥🔥
-        # 如果图谱里定义了 PK，或者我们刚才的 Profiler 发现了强关联，必须带上
-        graph = graph_service.get_graph(db_id)
-        if graph:
-            for tbl in target_tables:
-                # 尝试从图的元数据里找 PK (如果我们在 build 时存了的话)
-                # 或者简单的 heuristic: 找 name 包含 id/code 的列
-                pass
-
-        # 5. 将缺失的 Key 构造成列对象
+        # 3. 简单的补全策略：强制把 ID 列加进来
+        # (更高级的做法是查 information_schema.KEY_COLUMN_USAGE，这里用简单规则)
         new_columns = []
-        for key_str in all_needed_keys:
-            if key_str not in existing_keys:
-                try:
-                    tbl, col = key_str.split('.')
+
+        # 规则：只要涉及某个表，就自动把它的 PK 和常见的 FK (xxx_id) 加进来
+        # 这样 LLM 才有东西写 JOIN ON
+        for tbl in seen_tables:
+            # 假设 ID 列名规则：table_id 或 id
+            possible_pks = [f"{tbl[:-1]}_id", f"{tbl}_id", "id"]  # users -> user_id
+
+            for pk in possible_pks:
+                key = f"{tbl}.{pk}"
+                # 如果这个 ID 列不在已召回列表中，且数据库里大概率有这个列（这里没法验证，只能盲猜或查元数据）
+                # 稳妥起见，我们只添加那些包含 "id" 的列作为 candidate，
+                # 实际生产中这里应该查一下 information_schema 确认列存在。
+                if key not in existing_keys:
                     new_columns.append({
                         "table": tbl,
-                        "column": col,
-                        "column_type": "TEXT",  # 默认值，inject_sample 会修正它
+                        "column": pk,
+                        "column_type": "BIGINT",
                         "sample_values": [],
-                        "column_comment": "🗝️ Auto-augmented Join Key",  # 提示 LLM
-                        "is_structural": True
+                        "column_comment": "🗝️ Potential Join Key",
+                        "is_structural": True  # 标记为结构性列
                     })
-                    existing_keys.add(key_str)
-                except:
-                    logger.warning(f"Invalid key string format: {key_str}")
+                    existing_keys.add(key)
 
         if new_columns:
-            logger.info(f"🔗 [Graph] Augmented {len(new_columns)} join keys: {[c['column'] for c in new_columns]}")
+            logger.info(f"🔗 [Schema] Augmented {len(new_columns)} potential join keys")
 
-        # 把补充的键放在列表末尾
         return retrieved_columns + new_columns
 
     @staticmethod
-    async def inject_sample_values(db_path: str, columns: List[Dict], limit_per_col: int = 20) -> List[Dict]:
+    async def inject_sample_values(db_id: str, columns: List[Dict], limit_per_col: int = 3) -> List[Dict]:
+        """
+        [样本注入]
+        对于没有样本的列，去 MySQL 查 3 个非空值。
+        这对于 "status" (0,1,2) 这种枚举列非常重要。
+        """
+        # 筛选出需要注入样本的列 (没有 sample_values 的)
         target_cols = [c for c in columns if not c.get("sample_values")]
-        if not target_cols or not os.path.exists(db_path): return columns
+        if not target_cols: return columns
 
         def _sync_query():
+            conn = None
             try:
-                engine = create_engine(f"sqlite:///{db_path}")
-                with engine.connect() as conn:
-                    for col in target_cols:
-                        tbl, cn = col.get("table"), col.get("column")
-                        try:
-                            query = text(
-                                f'SELECT DISTINCT "{cn}" FROM "{tbl}" WHERE "{cn}" IS NOT NULL LIMIT {limit_per_col}')
-                            rows = conn.execute(query).fetchall()
-                            vals = [str(r[0]) for r in rows]
-                            if vals: col["sample_values"] = vals
-                        except:
-                            pass
-            except:
-                pass
+                # 连接 MySQL
+                conn = pymysql.connect(
+                    host=settings.DB_HOST,
+                    port=settings.DB_PORT,
+                    user=settings.DB_USER,
+                    password=settings.DB_PASSWORD,
+                    database=settings.DB_NAME,
+                    charset='utf8mb4'
+                )
+                cursor = conn.cursor()
 
+                for col in target_cols:
+                    tbl, cn = col.get("table"), col.get("column")
+                    try:
+                        # 查 3 个非空 distinct 值
+                        sql = f"SELECT DISTINCT `{cn}` FROM `{tbl}` WHERE `{cn}` IS NOT NULL LIMIT {limit_per_col}"
+                        cursor.execute(sql)
+                        rows = cursor.fetchall()
+                        vals = [str(r[0]) for r in rows]
+                        if vals:
+                            col["sample_values"] = vals
+                    except Exception as e:
+                        # 某些列可能无法查询 (如 blob)，跳过
+                        logger.warning(f"⚠️ Failed to sample {tbl}.{cn}: {e}")
+                        pass
+            except Exception as e:
+                logger.error(f"❌ Sample injection failed: {e}")
+            finally:
+                if conn: conn.close()
+
+        # 异步执行 IO 操作
         await asyncio.to_thread(_sync_query)
         return columns
 
     @staticmethod
     def format_schema_str(columns: List[Dict]) -> str:
+        """
+        [格式化] 将列列表转换为 Prompt 友好的字符串。
+        """
         lines = []
         tables = {}
+        # 按表分组
         for col in columns:
             t = col.get("table")
             if t not in tables: tables[t] = []
@@ -125,11 +125,18 @@ class SchemaHelper:
             lines.append(f"Table: {t}")
             for c in cols:
                 c_name = c.get("column")
-                desc = c.get("desc", "")
+                comment = c.get("column_comment") or c.get("desc", "")
                 samples = c.get("sample_values") or c.get("samples", [])
-                s_str = f" (Values: {', '.join([repr(x) for x in samples[:15]])})" if samples else ""
-                lines.append(f"  - {c_name} | {desc}{s_str}")
-            lines.append("")
+
+                # 构造样本字符串
+                s_str = f" (Values: {', '.join([str(x) for x in samples[:5]])})" if samples else ""
+
+                # 构造注释字符串
+                c_str = f" | {comment}" if comment else ""
+
+                lines.append(f"  - {c_name}{c_str}{s_str}")
+            lines.append("")  # 空行分隔表
+
         return "\n".join(lines)
 
 

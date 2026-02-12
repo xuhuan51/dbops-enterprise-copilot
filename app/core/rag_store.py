@@ -31,7 +31,7 @@ class MilvusDAO:
             logger.error(f"❌ Milvus Connection Failed: {e}")
 
     # ==========================================
-    # 1. Schema 集合 (表结构)
+    # 1. Schema 集合 (列结构)
     # ==========================================
     def _init_schema_collection(self):
         name = "rag_schema_bird"
