@@ -1,156 +1,123 @@
-# Enterprise Copilot (SQL Agent + Doc RAG) — 从 0 到 1
+# DeepOps Enterprise Copilot ⚡
 
-一个企业级 Data Copilot：同一入口自动路由到 **SQL Agent（结构化查询）** 或 **Doc RAG Agent（技术文档问答）**。  
-目标场景：**单库几百表**，支持 **权限先行、可解释、可审计、可控成本**，并提供 Docker / K8s 部署能力。
+> **Next-Gen Text-to-SQL Agent powered by LangGraph & Graph RAG**
+> 
+> *基于图谱增强与自我反思机制的企业级数据库运维智能助手*
 
----
+[![Status](https://img.shields.io/badge/Status-Internal_v2.0-blueviolet)]()
+[![Stack](https://img.shields.io/badge/Tech-LangGraph_|_NetworkX_|_Milvus_|_FastAPI-green)]()
+[![License](https://img.shields.io/badge/License-MIT-blue)]()
 
-## 1. 目标与特性
+![DeepOps Demo](assets/demo.gif)
+*(演示：自然语言查询 -> 意图识别 -> 混合检索 -> 图谱推理 -> SQL 自愈生成 -> 智能可视化)*
 
-### 1.1 核心能力
-- **SQL Agent**
-  - 权限过滤（只在用户可访问表范围内检索）
-  - 表/字段召回（TopK 缩小 prompt）
-  - 约束式 SQL 生成（只允许使用候选表字段）
-  - Guardrail（禁 DDL/DML、limit/时间条件、可选 EXPLAIN 阈值）
-  - 执行与结果解释
-- **Doc RAG Agent**
-  - 文档导入（ingest）→ chunk → 索引（BM25/Embedding）
-  - 检索增强生成（RAG）+ 引用溯源（citations）
-  - 文档增量更新（hash 变更才重建）
-- **Router（统一入口）**
-  - 判断走 SQL / RAG / 澄清（clarify）
-  - 输出 route + confidence + reason
+## 📖 项目简介 (Introduction)
 
-### 1.2 工程化要求（企业级思维）
-- **可复现**：本地先跑通，后续支持 Docker / K8s
-- **可观测**：trace_id + 事件日志（JSONL）
-- **可控**：权限先行 + SQL 安全护栏 + 超时/限流
+**DeepOps Enterprise Copilot** 是一个面向复杂企业数据库场景的智能运维 Agent。
+
+针对传统 Text-to-SQL 在**多表关联 (JOIN)** 和 **业务术语理解** 上的痛点，本项目采用了 **LangGraph** 构建环形状态机，并创新性地引入了 **Schema Graph RAG** 技术。通过 NetworkX 构建的全库表关系图谱，系统能够自动计算最佳 JOIN 路径，结合语义检索（Milvus）和值扫描（Value Scanning），实现高准确率的 SQL 生成与自愈。
 
 ---
 
-## 2. 总体架构
+## 🚀 核心技术架构 (Architecture)
 
-见下方「架构图」Mermaid。
-
----
-
-## 3. 项目结构（阶段性演进）
-```text
-dbops-enterprise-copilot/
-├── 📂 .github/                  # CI/CD 流水线配置 (后续加)
-├── 📂 deploy/                   # 部署相关 (Docker, K8s)
-│   └── docker-compose.yml       # 🐳 [核心] 一键启动 Milvus, Redis, MySQL
-│
-├── 📂 app/                      # 🐍 核心代码库
-│   ├── __init__.py
-│   ├── main.py                  # 🚀 [入口] FastAPI 应用入口，全局异常处理
-│   │
-│   ├── 📂 api/                  # 🌐 [接口层] 定义 RESTful API
-│   │   └── v1/
-│   │       └── chat.py          # /chat 接口，接收用户请求
-│   │
-│   ├── 📂 core/                 # ⚙️ [核心层] 全局配置
-│   │   ├── config.py            # 加载 .env，管理 Milvus/OpenAI 配置
-│   │   └── logger.py            # 企业级日志配置 (Loguru)
-│   │
-│   ├── 📂 modules/              # 🧠 [业务逻辑层] 核心智能体模块
-│   │   ├── router/
-│   │   │   └── semantic_router.py # 意图分流 (Router)
-│   │   │
-│   │   ├── agent_sql/           # 📊 SQL 专家智能体
-│   │   │   ├── schema_linker.py # Schema Linking (对接 Milvus)
-│   │   │   ├── generator.py     # Text-to-SQL 生成逻辑
-│   │   │   └── validator.py     # 安全护栏 (SQL 语法/权限检查)
-│   │   │
-│   │   └── agent_rag/           # 📄 文档专家智能体
-│   │       ├── ingest.py        # 文档切片与入库
-│   │       └── retriever.py     # 混合检索 (Milvus + BM25)
-│   │
-│   └── 📂 infrastructure/       # 🏗️ [基础设施层] 数据库连接器
-│       ├── milvus_conn.py       # 🔌 Milvus 连接池封装
-│       ├── mysql_conn.py        # 🔌 业务数据库连接
-│       └── redis_conn.py        # 🔌 Redis 缓存连接
-│
-├── .env                         # 🔑 敏感信息 (API Key, DB密码)
-├── .gitignore                   # ✅ Git 忽略配置
-├── Dockerfile                   # 📦 应用镜像构建文件
-└── requirements.txt             # 📦 依赖列表
-```
-
-### 3.1 当前阶段（MVP）
-
+### 1. 🧠 Agentic Workflow (基于 LangGraph 的状态机)
+系统摒弃了线性的 Chain 结构，采用 **LangGraph** 定义了一个具备“反思”能力的循环工作流：
 
 ```mermaid
 graph TD
-    %% === 样式定义 ===
-    classDef user fill:#2d3436,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef router fill:#0984e3,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef sqlAgent fill:#00b894,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef ragAgent fill:#6c5ce7,stroke:#fff,stroke-width:2px,color:#fff;
-    classDef db fill:#f1c40f,stroke:#e67e22,stroke-width:2px,color:#2d3436;
-    classDef shared fill:#95a5a6,stroke:#fff,stroke-width:1px,color:#fff;
+    %% --- 样式定义 ---
+    classDef action fill:#0984e3,color:white,stroke:none,rx:5,ry:5;
+    classDef check fill:#f1c40f,color:black,stroke:none,rx:5,ry:5;
+    classDef db fill:#6c5ce7,color:white,stroke:none,rx:5,ry:5;
+    classDef module fill:#2d3436,color:white,stroke:#fff,stroke-width:1px,stroke-dasharray: 5 5;
 
-    %% === 第一层：入口与分发 ===
-    subgraph "Layer 1: 用户入口与路由"
-        User(👱 用户提问 User Query):::user
-        Router{🧠 意图分流 Router}:::router
-        
-        User --> Router
-    end
-
-    %% === 第二层：双 Agent 核心逻辑 ===
-    subgraph "Layer 2: 智能体层 Agent Layer"
+    %% --- 主流程开始 ---
+    Start((用户提问)) --> Router["🚦 意图路由节点"]:::action
+    Router --> Expand["🔍 关键词扩展"]:::action
+    
+    %% === 🔥 修复点：标题加了双引号 ===
+    subgraph Orchestrator ["📚 混合检索编排层 (Orchestrator)"]
         direction TB
         
-        %% 左侧：SQL Agent
-        subgraph "📊 SQL Agent (查数据)"
-            direction TB
-            S1[1. Schema Linking<br/>只找相关的表]:::sqlAgent
-            S2[2. SQL 生成<br/>Text-to-SQL]:::sqlAgent
-            S3[3. 安全护栏<br/>语法/权限检查]:::sqlAgent
-            S4[4. SQL 执行器<br/>Executor]:::sqlAgent
-            
-            S1 --> S2 --> S3 --> S3_Check{通过?}
-            S3_Check -->|Yes| S4
-            S3_Check -->|No| S_Err[🚫 拒绝/重试]:::sqlAgent
-        end
-
-        %% 右侧：RAG Agent
-        subgraph "📄 RAG Agent (查文档)"
-            direction TB
-            R1[1. 混合检索<br/>Keyword + Vector]:::ragAgent
-            R2[2. 重排序<br/>Rerank]:::ragAgent
-            R3[3. 答案生成<br/>LLM + 引用]:::ragAgent
-            
-            R1 --> R2 --> R3
-        end
-    end
-
-    %% === 第三层：基础设施与存储 ===
-    subgraph "Layer 3: 基础设施 Infrastructure"
-        direction TB
+        %% 入口
+        Expand --> Dispatcher("任务分发"):::module
         
-        VectorDB[(🗄️ 向量数据库<br/>ChromaDB / Milvus)]:::db
-        BusinessDB[(💾 业务数据库<br/>MySQL / PG)]:::db
-        Cache[(⚡ Redis 缓存<br/>Schema/Session)]:::shared
+        %% 并行召回
+        Dispatcher -->|关键词| VectorSearch["📐 向量检索<br/>Schema & Few-Shot"]:::db
+        Dispatcher -->|意图| RuleSearch["🧠 知识库检索<br/>业务计算规则"]:::db
+        
+        %% 图谱推理
+        Dispatcher -->|表名| GraphEngine["🕸️ 图谱推理引擎<br/>斯坦纳树 / 最短路径"]:::db
+        
+        %% 值扫描
+        VectorSearch -.->|候选列| ValueScan["🔎 值扫描 (Value Scan)<br/>模糊匹配映射"]:::action
+        
+        %% 融合
+        VectorSearch --> ContextMerge
+        RuleSearch --> ContextMerge
+        GraphEngine --> ContextMerge
+        ValueScan --> ContextMerge("📝 上下文组装"):::module
     end
+    %% ====================================
 
-    %% === 核心链路逻辑 ===
+    %% --- 进入反思循环 ---
+    %% === 🔥 修复点：标题加了双引号 ===
+    subgraph CoreLoop ["⚡ 核心反思循环 (Reflective Loop)"]
+        ContextMerge --> Generate["🧠 SQL 生成"]:::action
+        Generate --> Verify{"🛡️ 安全校验"}:::check
+        
+        Verify --"❌ 语法/策略拦截"--> Generate
+        Verify --"✅ 校验通过"--> Execute{"🚀 执行节点"}:::check
+        
+        Execute --"❌ 运行时报错<br/>(触发自愈机制)"--> Generate
+    end
     
-    %% 1. 路由分发
-    Router -->|意图: 统计/查询| S1
-    Router -->|意图: 知识/流程| R1
+    Execute --"✅ 执行成功"--> End((最终结果))
 
-    %% 2. Agent 与 数据库的交互
-    
-    %% SQL Agent 的交互
-    S1 -.->|检索表结构元数据| VectorDB
-    S4 <-->|执行 SQL 查询| BusinessDB
-    
-    %% RAG Agent 的交互
-    R1 <-->|检索文档切片| VectorDB
+    %% --- 底部图例 ---
+    style Orchestrator fill:#dfe6e9,stroke:#b2bec3,color:#2d3436
+```
 
-    %% 3. 输出
-    S4 --> FinalOutput(📝 最终回复):::user
-    R3 --> FinalOutput
+## 2. 项目结构（阶段性演进）
+```text
+dbops-enterprise-copilot/
+├── 📜 main.py                    # [Entry] FastAPI 后端启动入口
+├── 📂 app/
+│   ├── 📂 api/
+│   │   └── v1/
+│   │       └── agent.py          # 核心 API 路由 (Chat Interface)
+│   │
+│   ├── 📂 core/                  # [Infrastructure] 基础设施层
+│   │   ├── config.py             # 全局环境变量配置
+│   │   ├── llm.py                # LLM 模型工厂 (Model Factory)
+│   │   ├── embedding.py          # 向量化模型单例
+│   │   ├── rag_store.py          # Milvus DAO (Schema/Knowledge/FewShot 集合管理)
+│   │   ├── prompts.py            # Prompt 模板库 (Router/GenSQL/FixSQL)
+│   │   └── state.py              # LangGraph 全局状态定义 (AgentState)
+│   │
+│   ├── 📂 graph/                 # 🔥 [Core Logic] LangGraph 状态机
+│   │   ├── graph.py              # 工作流定义 (Workflow & Conditional Edges)
+│   │   └── 📂 nodes/             # 独立功能节点
+│   │       ├── router_node.py        # 意图识别
+│   │       ├── retrieval_node.py     # 检索调度
+│   │       ├── generate_node.py      # SQL 生成
+│   │       ├── verification_node.py  # 语法检查与权限审计
+│   │       └── execution_node.py     # SQL 执行与反馈
+│   │
+│   └── 📂 modules/               # [Business Modules] 业务组件
+│       ├── 📂 retrieval/         # 🔍 检索增强引擎 (RAG Engine)
+│       │   ├── orchestrator.py       # 🧠 检索编排器 (Schema + Knowledge + Value)
+│       │   ├── value_scanner.py      # 模糊值匹配 (Value Linking)
+│       │   ├── schema_helper.py      # Schema 格式化与 Token 压缩
+│       │   ├── 📂 graph/             # 🕸️ 图谱增强 (Graph RAG)
+│       │   │   ├── builder.py            # 图构建器 (NetworkX MultiGraph)
+│       │   │   ├── searcher.py           # 路径搜索算法 (Steiner Tree / Shortest Path)
+│       │   │   └── service.py            # 图服务单例
+│       │   └── 📂 knowledge/         # 业务规则检索
+│       │       └── retriever.py
+│       │
+│       └── 📂 sql/               # ⚡ 执行层
+│           ├── executor.py           # SQL 执行器 (SQLite/MySQL 适配)
+│           └── guardrail.py          # 安全护栏 (Read-Only 检查)
+```
