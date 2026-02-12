@@ -7,16 +7,71 @@ from app.core.config import settings
 from app.core.llm import get_llm
 from app.core.state import AgentState
 from app.core.logger import logger
-
-# 🔥 核心：导入两个 Prompt
-# GEN_SQL_PROMPT: 用于第一次从零生成 (重型)
-# SQL_REPAIR_PROMPT: 用于根据报错或反馈进行修复 (轻型)
 from app.core.prompts import GEN_SQL_PROMPT, SQL_REPAIR_PROMPT
 
 
 # ==============================================================================
-# 🛠️ 辅助函数
+# 🛠️ 辅助函数：结构化 Schema 组装器
 # ==============================================================================
+
+def _build_rich_schema_json(retrieved_columns: List[Dict]) -> str:
+    """
+    将检索到的列信息组装成精炼的 JSON 格式，重点突出业务含义和数据分布。
+    """
+    if not retrieved_columns:
+        return "No schema information found."
+
+    tables_structure = {}
+
+    for col in retrieved_columns:
+        table_name = col.get("table") or col.get("table_name")
+        col_name = col.get("column") or col.get("column_name")
+
+        # 1. 获取元数据 (兼容不同来源的 key)
+        # 如果是 profile_schema_enhanced 生成的，通常在 metadata 字段里
+        meta = col.get("metadata", col)
+
+        # 2. 提取高价值信息
+        col_info = {
+            "type": meta.get("data_type") or meta.get("column_type", "UNKNOWN"),
+            "comment": meta.get("column_comment") or col.get("desc", ""),
+        }
+
+        # [A] 业务语义 (优先用 business_meaning，没有则用 ai_description)
+        biz_meaning = meta.get("business_meaning")
+        ai_desc = meta.get("ai_description")
+        if biz_meaning:
+            col_info["meaning"] = biz_meaning
+        elif ai_desc:
+            col_info["description"] = ai_desc
+
+        # [B] 数据分布 (非常重要，用于 WHERE 条件)
+        dist = meta.get("value_distribution")
+        if dist:
+            # 只取 Top 5 分布，节省 Token
+            top_dist = dict(sorted(dist.items(), key=lambda x: x[1], reverse=True)[:5])
+            col_info["distribution_top5"] = top_dist
+
+        # [C] 数值范围 (用于 > < 比较)
+        numeric = meta.get("numeric_stats")
+        if numeric:
+            col_info["stats"] = numeric
+
+        # [D] 样本值 (兜底)
+        samples = meta.get("sample_values") or col.get("sample_values")
+        if samples and not dist:  # 如果有分布就不展示样本了，省空间
+            col_info["samples"] = samples[:3]
+
+        # 3. 按表分组
+        if table_name not in tables_structure:
+            tables_structure[table_name] = []
+
+        # 把列名作为 key 或者包含在对象里均可，这里作为 key 更直观
+        tables_structure[table_name].append({col_name: col_info})
+
+    # 序列化为 JSON 字符串
+    return json.dumps(tables_structure, ensure_ascii=False, indent=2)
+
 
 def _format_history(history: List[Any]) -> str:
     if not history: return "无 (这是第一轮对话)"
@@ -30,213 +85,151 @@ def _format_history(history: List[Any]) -> str:
     return "\n".join(context_lines)
 
 
-def _dedup_keep_order(items: List[str], limit: int | None = None) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        x = (x or "").strip()
-        if not x or x in seen: continue
-        seen.add(x)
-        out.append(x)
-    return out[:limit] if limit else out
-
-
 # ==============================================================================
-# 🚀 核心生成节点 (Final Ultimate Version)
+# 🚀 核心生成节点
 # ==============================================================================
 
 async def generate_node(state: AgentState) -> Dict[str, Any]:
     """
-    Generator Node
-    策略逻辑：
-    1. 判断是否存在错误来源 (Execution Error 或 Verifier Feedback)。
-    2. 如果有错且有旧代码 -> 进入 [Repair Mode] (使用 SQL_REPAIR_PROMPT)。
-    3. 否则 -> 进入 [Normal Mode] (使用 GEN_SQL_PROMPT)。
+    Generator Node (JSON Schema Version)
     """
-    # --- 1. 获取 State ---
     question = state.get("question", "")
     history = state.get("history", [])
 
     # 状态标志
-    execution_error = state.get("execution_error")  # SQLite 报错
-    generated_sql = state.get("generated_sql")  # 旧 SQL
-    feedback = state.get("feedback", "")  # Verifier 反馈
-    verified = state.get("verified", True)  # 验证状态
+    execution_error = state.get("execution_error")
+    generated_sql = state.get("generated_sql")
+    feedback = state.get("feedback", "")
+    verified = state.get("verified", True)
 
-    retry_count = state.get("retry_count", 0)
+    # 获取原始检索结果 (List[Dict])
+    retrieved_columns = state.get("retrieved_columns", [])
 
-    # 上下文相关
-    schema_str = state.get("schema_str", "")
-    join_paths = state.get("join_paths", [])
+    # 🔥 核心修改：将 Schema 转换为 Rich JSON 字符串
+    rich_schema_json = _build_rich_schema_json(retrieved_columns)
+
+    # 其他上下文
     business_rules = state.get("business_rules", [])
     value_matches = state.get("value_matches", [])
     few_shot_examples = state.get("few_shot_examples", [])
+    join_paths = state.get("join_paths", [])
 
     # 历史记录
     history_context = _format_history(history) if history else ""
 
     # ----------------------------------------------------
-    # A. 上下文组装 (Logic Flattening)
+    # A. 规则与约束组装
     # ----------------------------------------------------
-    # 即使是修复模式，也需要 Rules 和 Schema，所以先组装好
-
-    # 1. 处理 Value Matches (Hard Filters & Hints)
-    hard_filters: List[str] = []
-    soft_hints: List[str] = []
-    if value_matches:
-        for m in value_matches:
-            s = str(m).strip()
-            if not s: continue
-            if "CONSTRAINT" in s or "hard" in s.lower():
-                hard_filters.append(s)
-            else:
-                soft_hints.append(s)
-
-    # 2. 处理 Business Rules
-    general_rules: List[str] = []
+    # 1. 业务规则
+    general_rules = []
     if business_rules:
         for r in business_rules:
             txt = r.get("content") if isinstance(r, dict) else str(r)
-            if txt.strip(): general_rules.append(txt.strip())
+            if txt.strip(): general_rules.append(f"- {txt.strip()}")
+    rules_str = "\n".join(general_rules) if general_rules else "No specific business rules."
 
-    # 构建 rules_str (包含业务规则和值匹配提示)
-    # 这对修复模式至关重要，防止修好了语法但丢了业务逻辑
-    rules_blocks = []
-    if general_rules:
-        rules_blocks.extend([f"- 💡 {r}" for r in general_rules])
-    if soft_hints:
-        deduped_hints = _dedup_keep_order(soft_hints, limit=5)
-        if deduped_hints:
-            rules_blocks.append("\n**Matched Value Hints:**")
-            rules_blocks.extend([f"- {h}" for h in deduped_hints])
-    rules_str = "\n".join(rules_blocks) if rules_blocks else "No additional business rules."
+    # 2. 值匹配 (Constraints)
+    constraints = []
+    if value_matches:
+        for m in value_matches:
+            # 过滤一下格式
+            s = str(m).strip()
+            if "CONSTRAINT" in s:
+                constraints.append(f"🔴 {s}")
+            else:
+                constraints.append(f"🟡 {s}")
+    constraints_str = "\n".join(constraints) if constraints else "No mandatory value filters."
 
-    # 构建 constraints_str (仅用于 Normal Mode)
-    constraints_str = "No specific mandatory filters."
-    if hard_filters:
-        constraints_str = "\n".join([f"🔴 FILTER: {c}" for c in hard_filters])
-
-    # 构建 join_paths_str (仅用于 Normal Mode)
-    paths_context = "No specific join paths provided."
-    if join_paths:
-        paths = [str(p) for p in join_paths]
-        paths_context = "\n".join(paths[:5])
-
-    # 构建 few_shot_str (仅用于 Normal Mode)
-    few_shot_str = "No few-shot examples available."
+    # 3. Few-Shot
+    few_shot_str = "No examples."
     if few_shot_examples:
         ex_lines = []
         for i, ex in enumerate(few_shot_examples):
-            ex_lines.append(f"--- Example {i + 1} ---")
-            ex_lines.append(f"Q: {ex.get('question', '')}")
-            if ex.get('evidence'): ex_lines.append(f"Note: {ex.get('evidence')}")
-            ex_lines.append(f"SQL: {ex.get('sql', '')}")
-        few_shot_str = "\n".join(ex_lines)
+            ex_lines.append(f"Example {i + 1}:\nQ: {ex.get('question')}\nSQL: {ex.get('sql')}")
+        few_shot_str = "\n\n".join(ex_lines)
+
+    # 4. Join Paths
+    paths_str = "\n".join([str(p) for p in join_paths[:3]]) if join_paths else "Auto-detect based on schema FKs."
 
     # ----------------------------------------------------
-    # 🔥 B. 策略分流 (核心逻辑)
+    # B. 提示词构造
     # ----------------------------------------------------
-
     llm = get_llm(model_name=settings.LLM_MODEL)
     final_prompt = ""
-    mode_log = ""
 
-    # 确定当前的“错误信息” (Execution Error 优先级高于 Feedback)
+    # 确定错误上下文
     current_error = None
     if execution_error:
-        current_error = f"Execution Failed: {execution_error}"
+        current_error = f"Execution Error: {execution_error}"
     elif not verified and feedback:
-        current_error = f"Verifier Critique: {feedback}"
+        current_error = f"Feedback: {feedback}"
 
-    # 🚦 分支判断
-
-    # 【模式 A：统一修复模式 (Repair Mode)】
-    # 条件：(有报错 OR 有反馈) AND 有旧代码
+    # 🟢 修复模式
     if current_error and generated_sql:
-
-        # 使用轻量级的 SQL_REPAIR_PROMPT
-        # 它可以让 LLM 聚焦于 Schema、错误信息和旧代码，避免被 Few-Shot 干扰
+        logger.info(f"🔧 [Generator] Entering Repair Mode...")
+        # 注意：这里我们把 rich_schema_json 传给 schema_context
+        # 你的 prompts.py 里的 SQL_REPAIR_PROMPT 需要能接受 json 格式的 schema
+        # 通常大模型对 JSON 自适应很好，不需要改 prompt template 里的文字
         final_prompt = SQL_REPAIR_PROMPT.format(
             question=question,
-            schema_context=schema_str,
-            rules_context=rules_str,  # 带上规则，确保逻辑正确
+            schema_context=rich_schema_json,  # 🔥 传入 JSON
+            rules_context=rules_str,
             previous_sql=generated_sql,
-            error_msg=current_error  # 无论是报错还是骂声，都填这里
+            error_msg=current_error
         )
 
-    # 【模式 B：从零生成模式 (Creation Mode)】
-    # 条件：第一次生成 OR 之前没有旧代码
+    # 🔵 生成模式
     else:
-        mode_log = "🎨 [Normal Mode] Generating from scratch..."
-        logger.info(mode_log)
-
-        # 使用重型的 GEN_SQL_PROMPT
+        logger.info(f"🎨 [Generator] Generating from scratch...")
         final_prompt = GEN_SQL_PROMPT.format(
             history_context=history_context,
-            schema_context=schema_str,
+            schema_context=rich_schema_json,  # 🔥 传入 JSON
             constraints_context=constraints_str,
             rules_context=rules_str,
-            join_paths_context=paths_context,
+            join_paths_context=paths_str,
             few_shot_context=few_shot_str,
             question=question
         )
 
     # ----------------------------------------------------
-    # C. 调用模型与解析
+    # C. LLM 调用
     # ----------------------------------------------------
     try:
         messages = [
-            SystemMessage(content="You are a SQL expert. Output ONLY valid Markdown with 'audit' and 'sql' blocks."),
+            SystemMessage(
+                content="You are a SQL expert. The schema is provided in JSON format with rich semantic info. Use it to write accurate SQL."),
             HumanMessage(content=final_prompt)
         ]
 
         response = await llm.ainvoke(messages)
         content = response.content
 
-        # 解析逻辑 (统一处理)
+        # 解析 SQL (保持原有逻辑)
         sql = ""
         thought = ""
 
-        # 1. 提取 SQL
         sql_match = re.search(r"```sql\n(.*?)\n```", content, re.DOTALL)
         if sql_match:
             sql = sql_match.group(1).strip()
         else:
-            # 兜底
-            clean_text = content.replace("```sql", "").replace("```", "").strip()
-            if "SELECT" in clean_text.upper():
-                sql = clean_text
+            clean = content.replace("```sql", "").replace("```", "").strip()
+            if "SELECT" in clean.upper(): sql = clean
 
-        # 2. 提取 Audit
         audit_match = re.search(r"```audit\n(.*?)\n```", content, re.DOTALL)
-        if audit_match:
-            thought = audit_match.group(1).strip()
+        if audit_match: thought = audit_match.group(1).strip()
 
-        # 3. 补全分号
-        final_sql = sql
-        if final_sql and not final_sql.endswith(";"):
-            final_sql += ";"
+        if sql and not sql.endswith(";"): sql += ";"
 
-        logger.info(f"📝 [Generator] SQL Generated: {final_sql}")
+        logger.info(f"📝 [Generator] SQL Generated")
 
-        # ----------------------------------------------------
-        # D. 更新 State
-        # ----------------------------------------------------
         return {
-            "generated_sql": final_sql,
+            "generated_sql": sql,
             "generated_thought": thought,
-            "final_answer": final_sql,
-            # 🔥 关键：清空之前的报错信息，重置状态
-            # 如果这轮生成的 SQL 还有错，Verifier 或 Executor 会再次把这两个字段填上
+            "final_answer": sql,
             "execution_error": None,
-            "is_executable": None,
-            # 注意：verified 状态会在 verification_node 更新，这里不需要强制设为 True，
-            # 但通常生成新 SQL 后，我们假设它需要重新验证。
+            "is_executable": None
         }
 
     except Exception as e:
-        logger.error(f"❌ [Generator] LLM Call Failed: {e}", exc_info=True)
-        return {
-            "generated_sql": "",
-            "error_message": str(e)
-        }
+        logger.error(f"❌ Generation Failed: {e}")
+        return {"generated_sql": "", "error_message": str(e)}
