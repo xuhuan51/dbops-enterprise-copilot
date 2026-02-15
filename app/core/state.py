@@ -1,4 +1,3 @@
-# app/core/state.py
 import operator
 from typing import List, Dict, Any, TypedDict, Literal, Optional, Annotated
 from enum import Enum
@@ -7,7 +6,7 @@ from langchain_core.messages import BaseMessage
 
 
 # ==========================================
-# 1. 基础枚举与定义 (保持不变)
+# 1. 基础枚举与定义
 # ==========================================
 
 class IntentType(str, Enum):
@@ -25,51 +24,57 @@ CapabilityType = Literal[
 
 
 # ==========================================
-# 2. 结构化关键词与语义线索 (保持不变)
+# 1.  Router 输出 (只负责分流)
 # ==========================================
+class RouterOutput(BaseModel):
+    """Router 节点的产物：意图与资源开关"""
+    intent: IntentType = Field(..., description="用户的核心意图")
+    reason: str = Field(..., description="判断意图的理由")
 
-class KeywordItem(BaseModel):
-    keyword: str
-    type: Literal["CONCEPT", "VALUE"]
+    needs_clarify: bool = Field(default=False, description="是否需要进一步澄清")
+    clarify_questions: List[str] = Field(default_factory=list, description="追问话术")
+
+    # 资源开关 (默认开启)
+    needs_schema: bool = Field(default=True, description="是否检索表结构")
+    needs_knowledge: bool = Field(default=True, description="是否检索业务知识库")
+
+
+
+# ==========================================
+# 2. 结构化关键词与语义线索
+# ==========================================
+class KeywordTermGroup(BaseModel):
+    """单个关键词组（包含多个同义词）"""
+    group: str = Field(..., description="组的语义主题，如 '订单表', '状态字段', '城市值'")
+    terms: List[str] = Field(default_factory=list, description="该组的关键词列表")
+
+
+class SearchKeywords(BaseModel):
+    """检索关键词（分 concepts 和 values）"""
+    concepts: List[KeywordTermGroup] = Field(default_factory=list, description="概念关键词组（用于 Schema 检索）")
+    values: List[KeywordTermGroup] = Field(default_factory=list, description="值关键词组（用于值检索）")
 
 
 class SemanticHints(BaseModel):
-    target_hint: Optional[str] = Field(None, description="主要对象")
-    metric_hint: Optional[str] = Field(None, description="指标/字段含义")
-    filter_hints: List[str] = Field(default_factory=list, description="过滤原短语")
-    group_hint: Optional[str] = Field(None, description="分组线索")
-    time_hint: Optional[str] = Field(None, description="时间线索")
+    """语义线索"""
+    target_hint: Optional[str] = Field(None, description="查询主体")
+    metric_hint: Optional[str] = Field(None, description="查询指标")
+    filter_hints: List[str] = Field(default_factory=list, description="筛选条件")
+    group_hint: Optional[str] = Field(None, description="分组维度")
+    time_hint: Optional[str] = Field(None, description="时间范围")
 
 
-class CapabilityExpandOutput(BaseModel):
-    capabilities: List[CapabilityType] = Field(default_factory=list)
-    semantic_hints: SemanticHints = Field(default_factory=SemanticHints)
-    search_keywords: List[KeywordItem] = Field(default_factory=list)
+class ExpandOutput(BaseModel):
+    """Expand 节点输出"""
+    capabilities: List[str] = Field(default_factory=list, description="能力标签")
+    semantic_hints: SemanticHints = Field(default_factory=SemanticHints, description="语义线索")
+    search_keywords: SearchKeywords = Field(default_factory=SearchKeywords, description="检索关键词")
 
-
-# ==========================================
-# 3. Router 输出 (保持不变)
-# ==========================================
-
-class RouterOutput(BaseModel):
-    intent: IntentType = Field(...)
-    reason: str = Field(...)
-    needs_schema: bool = Field(...)
-    needs_knowledge: bool = Field(...)
-    needs_clarify: bool = Field(...)
-    query_complexity: Literal["simple", "medium", "hard"] = Field(...)
-    pruning_budget_cols: int = Field(...)
-    clarify_questions: List[str] = Field(default_factory=list)
-    capabilities: List[CapabilityType] = Field(default_factory=list)
-    semantic_hints: SemanticHints = Field(default_factory=SemanticHints)
-    search_keywords: List[KeywordItem] = Field(default_factory=list)
-    schema_query: Optional[str] = Field(None)
 
 
 # ==========================================
-# 4. Agent State (全局状态 - 已清理)
+# 3. Agent State (双插槽)
 # ==========================================
-
 class AgentState(TypedDict, total=False):
     # --- 基础信息 ---
     trace_id: str
@@ -77,9 +82,11 @@ class AgentState(TypedDict, total=False):
     db_id: str
     history: List[BaseMessage]
 
-    # --- 意图与路由 ---
-    intent: IntentType
-    intent_data: Optional[RouterOutput]
+    # --- 意图与路由 (Slot 1) ---
+    intent_data: Optional[RouterOutput]  # 👈 Router 填这里
+
+    # --- 扩展搜索信息 (Slot 2) ---
+    expand_data: Optional[ExpandOutput]  # 👈 Expand 填这里 (新加的)
 
     # --- 检索上下文 ---
     retrieved_tables: List[str]
@@ -89,26 +96,26 @@ class AgentState(TypedDict, total=False):
     business_rules: List[str]
     value_matches: List[str]
 
-    # 补充上下文 (Schema RAG 检索到的 Context)
+    # 补充上下文
     schema_context: str
     rules_context: str
     constraints_context: str
     join_paths_context: str
 
     # --- 生成与验证 ---
-    generated_sql: str  # LLM 生成的原始 SQL
-    final_sql: Optional[str]  # 清洗后实际执行的 SQL
-    verified: bool  # Verifier 结果
-    feedback: str  # Verifier 建议
-    feedback_history: Annotated[List[str], operator.add]  # 使用 operator.add 方便自动追加
+    generated_sql: str
+    final_sql: Optional[str]
+    verified: bool
+    feedback: str
+    feedback_history: Annotated[List[str], operator.add]
 
-    # 重试计数 (使用普通 int，由节点手动 state["retry_count"] += 1 控制)
+    # 重试
     retry_count: int
 
-    # --- 执行结果 (Execution - 统一命名) ---
-    execution_result: Optional[List[Dict[str, Any]]]  # 成功时的结果行
-    execution_error: Optional[str]  # 失败时的报错信息
-    is_executable: bool  # 是否执行成功
+    # --- 执行结果 ---
+    execution_result: Optional[List[Dict[str, Any]]]
+    execution_error: Optional[str]
+    is_executable: bool
 
     # --- 最终输出 ---
     final_answer: Optional[str]

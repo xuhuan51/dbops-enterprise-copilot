@@ -78,6 +78,26 @@ class MilvusDAO:
         ]
         return self._get_or_create_collection(name, fields, "BIRD SQL Few-Shot Examples")
 
+    def drop_collection(self, collection_name: str):
+        """清空指定的集合数据"""
+        name_map = {
+            "schema": "rag_schema_bird",
+            "knowledge": "rag_knowledge_bird",
+            "few_shot": "few_shot"
+        }
+        target_name = name_map.get(collection_name)
+        if target_name and utility.has_collection(target_name):
+            utility.drop_collection(target_name)
+            logger.info(f"🗑️ 已清空 Milvus 集合: {target_name}")
+            # 重新初始化一下
+            if collection_name == "schema":
+                self.schema_col = self._init_schema_collection()
+            elif collection_name == "knowledge":
+                self.knowledge_col = self._init_knowledge_collection()
+            elif collection_name == "few_shot":
+                self.few_shot_col = self._init_few_shot_collection()
+
+
     # ==========================================
     # 通用辅助：创建集合
     # ==========================================

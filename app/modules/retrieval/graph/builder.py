@@ -18,7 +18,7 @@ from app.core.logger import logger
 
 
 class SchemaGraphBuilder:
-    """简化版表关系图构建器 - 只保留最可靠的策略"""
+    """简表关系图构建器 - 只保留最可靠的策略"""
 
     def __init__(self, schema_catalog: List[Dict], encoder: Optional = None):
         """

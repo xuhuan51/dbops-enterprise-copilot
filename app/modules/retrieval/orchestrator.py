@@ -7,8 +7,6 @@ from app.modules.retrieval.graph.service import graph_service
 from app.modules.retrieval.knowledge.retriever import KnowledgeRetriever
 from app.core.state import AgentState
 from app.core.logger import logger
-
-# 🔥 引入拆分后的模块 (Helper Modules)
 from app.modules.retrieval.value_scanner import value_scanner
 from app.modules.retrieval.schema_helper import schema_helper
 from app.modules.retrieval.match_helper import match_helper
@@ -25,62 +23,87 @@ class RAGOrchestrator:
 
     async def get_retrieval_context(self, state: AgentState) -> Dict[str, Any]:
         """
-        v9.0: Modularized Orchestrator (MySQL Native)
-        执行完整的 RAG 检索流程
+        v9.1: Group-Based Retrieval Orchestrator
+        支持基于 ExpandNode 的语义分组并发检索
         """
-        # --- Context Unpacking (解包上下文) ---
+        # --- Context Unpacking ---
         question = state.get("question", "")
-        db_id = state.get("db_id", "")  # 这里通常是 "ecommerce"
-        intent_data = state.get("intent_data")
-        hints = getattr(intent_data, "semantic_hints", None)
+        db_id = state.get("db_id", "")
 
-        # =========================================================================
-        # 🟢 Stage 1: Keyword Extraction (关键词提取)
-        # =========================================================================
-        raw_keywords = getattr(intent_data, "search_keywords", [])
-        all_kw_strs, value_kw_strs = [], []
-
-        if raw_keywords:
-            for item in raw_keywords:
-                k_str = item.strip() if isinstance(item, str) else getattr(item, "keyword", "").strip()
-                k_type = getattr(item, "type", "CONCEPT") if hasattr(item, "type") else "CONCEPT"
-                if k_str:
-                    all_kw_strs.append(k_str)
-                    if str(k_type).upper() == "VALUE":
-                        value_kw_strs.append(k_str)
-
-        if not all_kw_strs:
-            all_kw_strs = [w for w in question.split() if len(w) > 3]
+        # 获取新版 Expand 输出
+        expand_data = state.get("expand_data")
+        hints = getattr(expand_data, "semantic_hints", None)
 
         logger.info(f"🔍 [Orchestrator] Retrieval for: {question[:50]}...")
 
         # =========================================================================
-        # 🔵 Stage 2: Concurrent Retrieval (并发召回)
+        # 🟢 Stage 1: Search Query Preparation (分组查询准备)
         # =========================================================================
-        tasks, task_names = [], []
+        schema_search_tasks = []  # 存储 (group_name, query_string)
+        value_kw_strs = []  # 存储用于值扫描的关键词
+        all_keywords_backup = []  # 用于 Knowledge 检索的汇总
 
-        # 2.1 Schema 召回 (Keywords + Hints)
-        if all_kw_strs:
-            tasks.append(asyncio.to_thread(rag_store.search_vectors, "schema", " ".join(all_kw_strs), db_id, 20))
-            task_names.append("SCHEMA_KEYWORDS")
+        if expand_data and expand_data.search_keywords:
+            # 1.1 处理 Concepts (按组准备检索词)
+            if expand_data.search_keywords.concepts:
+                for group in expand_data.search_keywords.concepts:
+                    if group.terms:
+                        # 策略：每个组生成一个独立的查询串
+                        # 例如 group="销量字段", terms=["销量", "sales"] -> query="销量 sales"
+                        query_str = " ".join(group.terms)
+                        group_name = group.group or "GENERAL"
+                        schema_search_tasks.append((group_name, query_str))
+                        all_keywords_backup.extend(group.terms)
 
+            # 1.2 处理 Values (提取用于 Stage 5)
+            if expand_data.search_keywords.values:
+                for group in expand_data.search_keywords.values:
+                    if group.terms:
+                        value_kw_strs.extend(group.terms)
+                        # Value 词有时候也能帮助召回 Schema (比如 "iPhone" 可能命中 tags 字段)
+                        # 这里选择性加入 backup，或者也可以为 Value 单独开一个 Schema 检索任务
+                        all_keywords_backup.extend(group.terms)
+
+        # 兜底：如果没有 expand 数据，使用分词
+        if not schema_search_tasks:
+            raw_keywords = [w for w in question.split() if len(w) > 1]
+            schema_search_tasks.append(("FALLBACK", " ".join(raw_keywords)))
+            all_keywords_backup = raw_keywords
+
+        # =========================================================================
+        # 🔵 Stage 2: Concurrent Retrieval (分组并发召回)
+        # =========================================================================
+        tasks = []
+        task_names = []
+
+        # 2.1 Schema 召回 - 核心变更：按组发射任务
+        # 既然我们分了组，就可以降低每个组的 top_k，依靠多路召回提升精度
+        for group_name, query_str in schema_search_tasks:
+            # top_k 可以设小一点，比如 10，因为我们有多个组
+            tasks.append(asyncio.to_thread(rag_store.search_vectors, "schema", query_str, db_id, 10))
+            task_names.append(f"SCHEMA_GROUP_{group_name}")
+
+        # 2.2 Schema 召回 - Hints 补充 (保持不变)
         if hints:
             if hints.metric_hint:
-                tasks.append(asyncio.to_thread(rag_store.search_vectors, "schema", hints.metric_hint, db_id, 15))
-                task_names.append("SCHEMA_METRIC")
+                tasks.append(asyncio.to_thread(rag_store.search_vectors, "schema", hints.metric_hint, db_id, 10))
+                task_names.append("SCHEMA_HINT_METRIC")
             if hints.filter_hints:
+                # filter hints 往往包含列名信息
                 tasks.append(
-                    asyncio.to_thread(rag_store.search_vectors, "schema", " ".join(hints.filter_hints), db_id, 15))
-                task_names.append("SCHEMA_FILTER")
+                    asyncio.to_thread(rag_store.search_vectors, "schema", " ".join(hints.filter_hints), db_id, 10))
+                task_names.append("SCHEMA_HINT_FILTER")
 
-        # 2.2 Knowledge 召回
-        tasks.append(self.knowledge_retriever.search_knowledge([], " ".join(all_kw_strs) or question, db_id, 3))
+        # 2.3 Knowledge 召回 (使用汇总的关键词)
+        knowledge_query = " ".join(all_keywords_backup) or question
+        tasks.append(self.knowledge_retriever.search_knowledge([], knowledge_query, db_id, 3))
         task_names.append("KNOWLEDGE")
 
+        # 执行并发
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
         # =========================================================================
-        # 🟠 Stage 3: Result Processing (结果去重)
+        # 🟠 Stage 3: Result Processing (结果去重与合并)
         # =========================================================================
         unique_candidates = {}
         knowledge_results = []
@@ -93,18 +116,28 @@ class RAGOrchestrator:
 
             t_name = task_names[i]
 
+            # 处理 Schema 结果
             if t_name.startswith("SCHEMA"):
                 all_hits = match_helper.recursive_extract_hits(res)
                 for hit in all_hits:
                     ent = getattr(hit, 'entity', hit.get('entity'))
                     if ent and ent.get('table_name') and ent.get('column_name'):
                         key = f"{ent['table_name']}.{ent['column_name']}"
+
+                        # 记录来源用于调试 (可选)
+                        # logger.debug(f"Hit: {key} from {t_name}")
+
+                        # 简单的去重逻辑：如果已存在，保留分数高的 (通常 Milvus 返回已排序，这里简单保留第一个即可)
+                        # 或者在这里做分数融合 (加权)
                         if key not in unique_candidates:
                             unique_candidates[key] = {
                                 "content": f"{ent['table_name']}.{ent['column_name']} {ent.get('column_comment', '')}",
                                 "entity": ent,
-                                "milvus_score": getattr(hit, 'score', 0)
+                                "milvus_score": getattr(hit, 'score', 0),
+                                "source_group": t_name  # 记录是哪个组召回的
                             }
+
+            # 处理 Knowledge 结果
             elif t_name == "KNOWLEDGE":
                 knowledge_results = res
 
@@ -122,28 +155,67 @@ class RAGOrchestrator:
         else:
             ranked = []
 
-        retrieved_columns = [{"table": r['entity']['table_name'], "column": r['entity']['column_name'],
-                              "sample_values": r['entity'].get("samples", [])} for r in ranked]
+        # 🔥 瘦身优化：只提取必要字段
+        retrieved_columns = []
+        for r in ranked:
+            ent = r['entity']
+
+            # 只保留核心字段（瘦身版）
+            slimmed_item = {
+                # 基础标识
+                "table_name": ent.get("table_name"),
+                "column_name": ent.get("column_name"),
+
+                # 核心元数据
+                "data_type": ent.get("data_type"),
+                "is_nullable": ent.get("is_nullable"),
+
+                # 统计信息
+                "sample_values": ent.get("sample_values", []),
+                "distinct_count": ent.get("distinct_count"),
+                "null_count": ent.get("null_count"),
+                "numeric_stats": ent.get("numeric_stats"),
+
+                # AI 语义描述
+                "ai_description": ent.get("ai_description", ""),
+            }
+
+            retrieved_columns.append(slimmed_item)
 
         selected_tables = {c['table'] for c in retrieved_columns}
 
         # =========================================================================
-        # 🔴 Stage 5: Value Scanning (值扫描)
+        # 🔴 Stage 5: Value Scanning (使用 Values 分组)
         # =========================================================================
         final_constraints = []
         if retrieved_columns:
-            scan_phrases = match_helper.prepare_scan_phrases(value_kw_strs, all_kw_strs, hints)
+            # 这里的 all_keywords_backup 仅作为辅助，重点是 value_kw_strs
+            scan_phrases = match_helper.prepare_scan_phrases(value_kw_strs, all_keywords_backup, hints)
             need_rescue = bool(hints and hints.filter_hints)
 
             try:
-                # 🔥 修改点：这里传入 db_id 而不是 db_path
-                # 注意：你需要确保 value_scanner.scan_tiered 能够接受 db_id 并使用 settings 连接数据库
                 raw_matches, rescue_cols = await asyncio.to_thread(
                     value_scanner.scan_tiered, db_id, retrieved_columns, scan_phrases, need_rescue
                 )
 
                 if rescue_cols:
-                    retrieved_columns.extend(rescue_cols)
+                    # ... (rescue_cols 瘦身代码保持不变) ...
+                    slimmed_rescue = []
+                    for col in rescue_cols:
+                        slimmed_rescue.append({
+                            "table_name": col.get("table_name"),
+                            "column_name": col.get("column_name"),
+                            "table": col.get("table_name"),
+                            "column": col.get("column_name"),
+                            "data_type": col.get("data_type"),
+                            "is_nullable": col.get("is_nullable"),
+                            "sample_values": col.get("sample_values", []),
+                            "distinct_count": col.get("distinct_count"),
+                            "null_count": col.get("null_count"),
+                            "numeric_stats": col.get("numeric_stats"),
+                            "ai_description": col.get("ai_description", ""),
+                        })
+                    retrieved_columns.extend(slimmed_rescue)
 
                 best = match_helper.select_best_matches(raw_matches, question, hints)
                 hard = [m.format_constraint() for m in best if m.strength == "hard"][:2]
@@ -154,6 +226,7 @@ class RAGOrchestrator:
             except Exception as e:
                 logger.error(f"❌ Value scan failed: {e}")
 
+        # ... (Stage 6 & 7 保持不变) ...
         # =========================================================================
         # 🟤 Stage 6: Graph Augmentation (图增强)
         # =========================================================================
@@ -163,14 +236,8 @@ class RAGOrchestrator:
         # =========================================================================
         # ⚫ Stage 7: Formatting (格式化)
         # =========================================================================
-        # 🔥 修改点：传入 db_id，SchemaHelper 需适配 MySQL 查询
         retrieved_columns = await schema_helper.inject_sample_values(db_id, retrieved_columns)
         schema_str = schema_helper.format_schema_str(retrieved_columns)
-
-        # [修改点] 移除了 BIRD 特有的 Global Rules (CDSCode 等)
-        # global_rules = [{"content": "order_status=1 means Pending Payment", "score": 1.0}]
-        # if isinstance(knowledge_results, list) and global_rules:
-        #    for r in global_rules: knowledge_results.insert(0, r)
 
         join_paths = []
         if len(selected_tables) >= 2:

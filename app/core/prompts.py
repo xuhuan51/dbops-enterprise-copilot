@@ -1,199 +1,346 @@
-
 ONE_PASS_ROUTER_PROMPT = """
-你是数据智能系统中的【决策分流引擎】。
-你的任务是：根据【对话历史】和【当前问题】，输出一个**严格的 JSON 决策对象**。
+你是智能数据助手中的【意图分类器】。
+你的唯一任务是：根据【对话历史】和【当前问题】，判断用户的核心意图。
 
 ========================
-【硬性输出约束】
-1. **JSON Only**: 严禁输出 Markdown (```json)，严禁输出解释性文字。
-2. **Format**: 必须以 "{{" 开头，以 "}}" 结尾。
-3. **Safety**: 不确定的意图（如缺少对象/时间），必须标记 needs_clarify=true。
+【意图定义 (Intent)】
+
+1. **DATA_QUERY** (核心业务):
+   - 用户想要查询数据、统计指标、看报表、分析趋势。
+   - 关键词：查一下、统计、销量、多少、排名、趋势、明细。
+
+2. **METADATA_QUERY** (元数据):
+   - 用户询问表结构、字段含义、指标定义、数据库有哪些表。
+   - 关键词：表结构、字段、有什么表、含义是什么。
+
+3. **CHAT** (闲聊/非业务):
+   - 问候、感谢、无关话题，或者与数据查询完全无关的对话。
+   - 关键词：你好、谢谢、你是谁、再见。
+
+4. **AMBIGUOUS** (模糊/需追问):
+   - 指代不清（"那个不对"）、上下文缺失、无法判断意图。
 
 ========================
-【决策字段定义】
-
-1. **intent** (枚举):
-   - "DATA_QUERY": 查数据 (e.g. "销量", "订单列表", "统计用户")
-   - "METADATA_QUERY": 查定义/结构 (e.g. "表结构", "GMV口径", "字段含义")
-   - "OPS_DIAGNOSIS": 运维/报错 (e.g. "查询慢", "报错500", "配置")
-   - "CHAT": 闲聊 (e.g. "你好", "谢谢")
-   - "AMBIGUOUS": 意图不清 (e.g. "怎么算?", "那个数据不对")
-
-2. **needs_knowledge** (Boolean):
-   - **True**: 涉及业务术语(大R/GMV/ROI)、枚举状态(已支付/异常)、运维报错、表结构查询。
-   - **False**: 简单的明细查询或通用统计。
-
-3. **query_complexity** (Enum):
-   - "simple": 单表 / 简单过滤 / TopN (预算: 20)
-   - "medium": 多条件 / 简单聚合 / 排序 (预算: 40)
-   - "hard": 多表 JOIN / 复杂分组 / 窗口函数 / 多指标 (预算: 60)
+【输出约束】
+1. 必须输出标准 JSON 格式。
+2. **严禁**输出 Markdown 标记（如 ```json）。
+3. 即使意图是 DATA_QUERY，也不需要你生成 SQL，只负责分类。
 
 ========================
-【Few-Shot 参考示例】(学习这些 Case 的逻辑)
+【Few-Shot 示例】
 
-**Case 1: 简单查询**
-Input: "帮我查一下北京地区昨天的订单列表"
-Output:
-{{
-  "intent": "DATA_QUERY",
-  "reason": "用户查询具体订单明细，有明确时间(昨天)和地点(北京)，逻辑简单。",
-  "needs_schema": true,
-  "needs_knowledge": false,
-  "needs_clarify": false,
-  "query_complexity": "simple",
-  "pruning_budget_cols": 20,
-  "clarify_questions": []
-}}
+Case 1: 查数据
+Input: "帮我看看上周北京的销售额"
+Output: {{"intent": "DATA_QUERY", "reason": "明确的时间和指标查询", "needs_clarify": false, "clarify_questions": []}}
 
-**Case 2: 复杂业务统计**
-Input: "统计上个月大R用户的流失率，按城市排名"
-Output:
-{{
-  "intent": "DATA_QUERY",
-  "reason": "涉及聚合统计和排名，'大R'和'流失率'是业务术语，需查知识库。",
-  "needs_schema": true,
-  "needs_knowledge": true,
-  "needs_clarify": false,
-  "query_complexity": "hard",
-  "pruning_budget_cols": 60,
-  "clarify_questions": []
-}}
+Case 2: 闲聊
+Input: "你叫什么名字？能做什么？"
+Output: {{"intent": "CHAT", "reason": "用户在进行非业务性质的寒暄", "needs_clarify": false, "clarify_questions": []}}
 
-**Case 3: 意图不明**
-Input: "为什么不对？"
-Output:
-{{
-  "intent": "AMBIGUOUS",
-  "reason": "缺少上下文，不知道指代什么不对，需要追问。",
-  "needs_schema": false,
-  "needs_knowledge": false,
-  "needs_clarify": true,
-  "query_complexity": "simple",
-  "pruning_budget_cols": 20,
-  "clarify_questions": ["请问具体是哪个数据或报表不对？", "能提供一下相关的查询ID吗？"]
-}}
+Case 3: 模糊
+Input: "为什么它是负数？"
+Output: {{"intent": "AMBIGUOUS", "reason": "缺少主语，不知道用户指代哪个指标", "needs_clarify": true, "clarify_questions": ["请问您指的哪个指标是负数？", "是指刚才查询的订单金额吗？"]}}
 
 ========================
-【当前任务】
+【当前输入】
 对话历史:
 {history}
 
 当前问题:
 {question}
 
-开始输出 JSON:
+请输出 JSON:
 """
 
-
-
-
 CAPABILITY_EXPAND_PROMPT = """
-你是一个【查询语义理解与检索桥接模块】。
-你的任务是将用户的自然语言问题（可能是中文或英文）转换为
-**结构化的语义意图**和**带有严格语义类型标记的检索关键词**。
+你是一个【语义理解与检索桥接模块】。
+你的任务是将用户的自然语言问题转换为**结构化的语义意图**和**带有严格语义类型标记的检索关键词分组**。
 
 ========================
 核心原则（非常重要）
 ========================
 1. **语义分层**：必须区分
-   - 用来“筛选行”的【实体值】
-   - 用来“选择列/口径/范围”的【概念或范围】
-2. **数据库对齐**：数据库 Schema 是英文，所有关键词需翻译为英文。
-3. **类型决定行为**：
-   - 只有【实体值】才允许用于数据库内容匹配（ValueLink）。
-   - 【范围/口径/阈值】严禁被当作具体数据库值。
-4. **严禁幻觉**：不要编造表名、列名或 SQL。
+   - 【实体值 VALUE】：用来"筛选行"的具体值（如：具体的产品名、城市名、状态码、ID）
+   - 【概念 CONCEPT】：用来"选择列/定位字段"的抽象概念（如：表名、列名、指标名、维度名）
+
+2. **关键词分组**：
+   - 同一语义簇的关键词（中英文、同义词、缩写）必须聚合在同一个 group 里
+   - 例如："订单"、"order"、"orders" 应该在一个 concepts 组内
+   - 例如："待支付"、"pending"、"unpaid" 应该在一个 values 组内
+
+3. **检索分工**：
+   - 【CONCEPT】→ Schema 检索（找表、列、字段定义）
+   - 【VALUE】→ 值检索（找匹配的数据行内容）
 
 ========================
-任务一：抽取能力桶 (Capabilities)
+任务一：抽取能力标签 (capabilities)
 ========================
-从以下列表中选择（可多选）：
-- LOOKUP
-- FILTER
-- COMPARISON
-- AGGREGATION
-- SORT
-- TOPK_LIMIT
-- GROUPING
-- JOIN
+从以下列表中选择适用的能力（可多选）：
+- LOOKUP          (简单查找)
+- FILTER          (条件筛选)
+- COMPARISON      (比较：大于/小于/范围)
+- AGGREGATION     (聚合：sum/avg/count/max/min)
+- SORT            (排序：升序/降序/top/bottom)
+- TOPK_LIMIT      (限制返回条数)
+- GROUPING        (分组统计)
+- JOIN            (多表关联)
+- TIME_RANGE      (时间范围查询)
 
 ========================
-任务二：提取语义线索 (Semantic Hints)
+任务二：提取语义线索 (semantic_hints)
 ========================
-- target_hint : 查询主体（school, student, district）
-- metric_hint : 查询指标（FRPM count, rate, phone number）
-- filter_hints: 人类可读的筛选条件描述
-- group_hint  : 分组依据
-- time_hint   : 时间范围
-
-========================
-任务三：生成检索关键词 (Search Keywords)
-========================
-请输出一个对象列表，每个对象包含 `keyword` 和 `type`。
-
-### Type 分类（必须严格遵守）
-
-1. **CONCEPT（概念）**
-- 通用名词、指标名、列语义、统计口径
-- **数字特殊规则**：如果数字出现在**比较级、阈值、结构描述**中（如 "over 1500", "top 10", "Grade 12"），**必须**标记为 CONCEPT。
-- 例子：
-  "school", "student", "rate", "count",
-  "FRPM", "free lunch",
-  "SAT", "Math",
-  "K-12", "Ages 5-17",
-  "1500" (上下文是 score over 1500 -> 可能是列名的一部分 NumGE1500)
-- **用途**：仅用于 Schema / Column 检索
-- ❌ 绝不能用于数据库值匹配
-
-2. **VALUE（实体值）**
-- 可以直接出现在 SQL WHERE 条件右侧的**等值匹配**内容
-- **仅限**：专有名词、ID、具体日期、明确的分类代码
-- 例子：
-  "Alameda", "Fresno",
-  "California",
-  "FAME Public Charter",
-  "90210",
-  "2000-01-01"
-- **用途**：可用于数据库内容匹配（ValueLink）
+提取以下信息（可为空）：
+- target_hint  : 查询的主实体（如：用户、订单、商品、评论）
+- metric_hint  : 查询的指标（如：金额、数量、评分、增长率）
+- filter_hints : 筛选条件列表（如：["地区=某城市", "状态=某状态", "时间=某时段"]）
+- group_hint   : 分组维度（如：按时间、按类别、按地区）
+- time_hint    : 时间范围（如：上个月、本季度、2024年）
 
 ========================
-重要判定规则（硬约束）
+任务三：生成关键词分组 (search_keywords)
 ========================
-1. **比较级数字禁令**：
-   - 用户说 "score over 1500", "population > 1000", "after 2010"
-   - 这里的 1500, 1000, 2010 **绝对不是** VALUE。
-   - 请标记为 CONCEPT（如果它有助于找列）或者不提取。
-
-2. **学段与口径禁令**：
-   - K-12, Ages 5-17, Grade 10
-   - 一律视为 CONCEPT。
-
-3. **唯一 VALUE 标准**：
-   - 只有当用户明确暗示“等于”、“叫做”、“ID是”时，才标记为 VALUE。
-
-========================
-输出格式 (Strict JSON)
-========================
+输出格式：
 {
-  "capabilities": [],
+  "concepts": [
+    {
+      "group": "组的语义主题",
+      "terms": ["关键词1", "关键词2", ...]
+    }
+  ],
+  "values": [
+    {
+      "group": "组的语义主题",
+      "terms": ["关键词1", "关键词2", ...]
+    }
+  ]
+}
+
+### CONCEPT（概念）分组规则
+- **定义**：表名、列名、字段名、统计指标、维度名
+- **示例分组**：
+  - {"group": "订单表", "terms": ["订单", "order", "orders"]}
+  - {"group": "金额字段", "terms": ["金额", "价格", "amount", "price"]}
+  - {"group": "时间字段", "terms": ["时间", "日期", "created_at", "date"]}
+- **用途**：Schema 检索，定位表和列
+
+### VALUE（实体值）分组规则
+- **定义**：WHERE 子句中的具体值、实体名称、状态码、ID
+- **示例分组**：
+  - {"group": "城市值", "terms": ["北京", "Beijing"]}
+  - {"group": "状态值", "terms": ["已发货", "shipped", "delivered"]}
+  - {"group": "商品名值", "terms": ["iPhone 15", "苹果15"]}
+- **用途**：值检索，匹配数据行
+
+========================
+Few-Shot Examples
+========================
+
+**Example 1: 基础筛选查询**
+Input: "查一下北京地区已发货的订单"
+Output:
+{
+  "capabilities": ["FILTER"],
+
   "semantic_hints": {
-    "target_hint": null,
+    "target_hint": "订单",
     "metric_hint": null,
+    "filter_hints": ["地区=北京", "状态=已发货"],
+    "group_hint": null,
+    "time_hint": null
+  },
+
+  "search_keywords": {
+    "concepts": [
+      {
+        "group": "订单表",
+        "terms": ["订单", "order", "orders"]
+      },
+      {
+        "group": "地区字段",
+        "terms": ["地区", "城市", "region", "city", "address"]
+      },
+      {
+        "group": "状态字段",
+        "terms": ["状态", "status", "order_status"]
+      }
+    ],
+    "values": [
+      {
+        "group": "城市值",
+        "terms": ["北京", "Beijing"]
+      },
+      {
+        "group": "状态值",
+        "terms": ["已发货", "shipped", "delivered"]
+      }
+    ]
+  }
+}
+
+**Example 2: 聚合统计**
+Input: "统计每个品类的销售总额和销量"
+Output:
+{
+  "capabilities": ["AGGREGATION", "GROUPING"],
+
+  "semantic_hints": {
+    "target_hint": "商品",
+    "metric_hint": "销售总额, 销量",
+    "filter_hints": [],
+    "group_hint": "按品类",
+    "time_hint": null
+  },
+
+  "search_keywords": {
+    "concepts": [
+      {
+        "group": "商品表",
+        "terms": ["商品", "product", "item", "goods"]
+      },
+      {
+        "group": "销售额字段",
+        "terms": ["销售额", "总额", "金额", "amount", "total_amount"]
+      },
+      {
+        "group": "销量字段",
+        "terms": ["销量", "数量", "sales_count", "quantity"]
+      },
+      {
+        "group": "品类字段",
+        "terms": ["品类", "类别", "分类", "category", "type"]
+      }
+    ],
+    "values": []
+  }
+}
+
+**Example 3: 范围查询与排序**
+Input: "找出价格在500到1000元之间的运动鞋，按价格从低到高"
+Output:
+{
+  "capabilities": ["FILTER", "COMPARISON", "SORT"],
+
+  "semantic_hints": {
+    "target_hint": "商品",
+    "metric_hint": "价格",
+    "filter_hints": ["品类=运动鞋", "价格>=500", "价格<=1000"],
+    "group_hint": null,
+    "time_hint": null
+  },
+
+  "search_keywords": {
+    "concepts": [
+      {
+        "group": "商品表",
+        "terms": ["商品", "product", "item"]
+      },
+      {
+        "group": "价格字段",
+        "terms": ["价格", "金额", "price", "amount"]
+      },
+      {
+        "group": "品类字段",
+        "terms": ["品类", "类别", "category", "type"]
+      }
+    ],
+    "values": [
+      {
+        "group": "品类值",
+        "terms": ["运动鞋", "跑鞋", "sports shoes", "sneakers"]
+      }
+    ]
+  }
+}
+
+**Example 4: 时间范围查询**
+Input: "上个月 iPhone 15 的销量和销售额是多少"
+Output:
+{
+  "capabilities": ["FILTER", "AGGREGATION", "TIME_RANGE"],
+
+  "semantic_hints": {
+    "target_hint": "商品",
+    "metric_hint": "销量, 销售额",
+    "filter_hints": ["商品名=iPhone 15"],
+    "group_hint": null,
+    "time_hint": "上个月"
+  },
+
+  "search_keywords": {
+    "concepts": [
+      {
+        "group": "商品表",
+        "terms": ["商品", "product", "item"]
+      },
+      {
+        "group": "销量字段",
+        "terms": ["销量", "销售数量", "sales_count", "quantity"]
+      },
+      {
+        "group": "销售额字段",
+        "terms": ["销售额", "金额", "total_amount", "amount"]
+      },
+      {
+        "group": "时间字段",
+        "terms": ["时间", "日期", "创建时间", "order_time", "created_at"]
+      },
+      {
+        "group": "商品名字段",
+        "terms": ["商品名", "名称", "product_name", "name"]
+      }
+    ],
+    "values": [
+      {
+        "group": "商品名值",
+        "terms": ["iPhone 15", "苹果15", "iPhone15"]
+      },
+      {
+        "group": "时间值",
+        "terms": ["上个月", "last month", "上月"]
+      }
+    ]
+  }
+}
+
+**Example 5: Top K 查询**
+Input: "销量前10的商品有哪些"
+Output:
+{
+  "capabilities": ["SORT", "TOPK_LIMIT", "AGGREGATION"],
+
+  "semantic_hints": {
+    "target_hint": "商品",
+    "metric_hint": "销量",
     "filter_hints": [],
     "group_hint": null,
     "time_hint": null
   },
-  "search_keywords": [
-    {"keyword": "string", "type": "CONCEPT" or "VALUE"}
-  ]
+
+  "search_keywords": {
+    "concepts": [
+      {
+        "group": "商品表",
+        "terms": ["商品", "product", "item"]
+      },
+      {
+        "group": "销量字段",
+        "terms": ["销量", "销售数量", "sales_count", "quantity"]
+      }
+    ],
+    "values": []
+  }
 }
 
 ========================
-用户输入
+当前用户输入
 ========================
 {question}
-"""
 
+请严格按照上述格式输出 JSON，必须包含：
+- capabilities (列表)
+- semantic_hints (对象，包含 target_hint, metric_hint, filter_hints, group_hint, time_hint)
+- search_keywords (对象，包含 concepts 和 values 两个列表)
+"""
 
 
 
