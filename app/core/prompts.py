@@ -360,6 +360,146 @@ KNOWLEDGE_ANSWER_PROMPT = """
 请直接输出回答内容：
 """
 
+"""
+列选择节点的 Prompt 模板
+职责：从检索到的列中，选出生成 SQL 真正需要的列
+"""
+
+
+
+COLUMN_SELECTOR_PROMPT = """你是一个数据库列选择专家。
+
+你的任务是：基于用户的自然语言问题和**语义分析要求**，从检索到的 Schema 中，**选出生成 SQL 真正需要的表和列**。
+
+## 核心原则
+1. **意图对齐**：仔细阅读【语义分析要求】，如果要求排序(SORT)，必须选排序字段；如果要求过滤(FILTER)，必须选条件字段。
+2. **完整性优先**：必须包含所有查询涉及的列（SELECT、WHERE, GROUP BY, ORDER BY）。
+3. **连接键可选**：主键/外键选不选都行，系统会自动补全。
+4. **必选值映射**：Value Mappings 中提到的列必须选中。
+
+---
+
+# 用户问题
+{question}
+
+## 语义分析要求 (Semantic Requirements - 重要参考!)
+{expand_requirements}
+
+## 检索到的表和列 (Context)
+{retrieved_schema}
+
+## 值映射提示 (Value Mappings)
+{value_mappings}
+
+## 业务规则 (Business Rules)
+{business_rules}
+
+---
+
+请根据上述信息，输出选中的列。
+## 选列策略
+
+### ✅ 必选列
+
+- **目标列**：用户想查询的字段（SELECT 子句）
+  - 例如："订单有哪些？" → 订单号、订单状态等订单信息
+
+- **筛选列**：出现在过滤条件里的字段（WHERE 子句）
+  - 例如："北京的订单" → 地区相关的列
+  - 例如："已发货的订单" → 订单状态列
+
+- **分组列**：用于聚合的维度字段（GROUP BY 子句）
+  - 例如："各地区的订单数量" → 地区列
+
+- **排序列**：用于排序的字段（ORDER BY 子句）
+  - 例如："按金额排序" → 金额列
+
+- **值映射指定的列**：如果 value_mappings 里提到某列，必选！
+
+### ⚠️ 可选列（不确定时就选上）
+
+- **相关字段**：与查询主题相关的列
+  - 例如：查订单，可能需要订单编号、订单时间、订单金额等
+
+- **辅助信息**：可能用于展示的列
+  - 例如：用户名、商品名称等
+
+### ❌ 可以不选的列
+
+- **完全无关**：与问题毫无关系的列
+  - 例如：查订单，不需要商品的库存预警阈值
+
+
+## 值映射的作用
+
+如果提供了 `value_mappings`，说明这些列有明确的筛选条件：
+- 例如："北京" → "北京市" in user_addresses.province
+- **你必须选中 user_addresses 表的 province 列！**
+
+## 输出要求
+
+严格按照以下 JSON Schema 输出：
+```json
+{{
+  "selected_columns": {{
+    "orders": ["order_no", "order_status", "total_amount"],
+    "user_addresses": ["province", "city"]
+  }}
+}}
+```
+
+### 字段说明
+
+- `selected_columns`: 对象，key 是表名，value 是该表选中的列名数组
+- **不需要 reason 字段**，直接给出选择结果即可
+
+## 示例
+
+### 输入
+```
+问题：北京已发货的订单有哪些？
+
+检索到的表：
+- orders: order_id, order_no, order_status, total_amount, user_id, created_at
+- users: user_id, user_name, phone, email
+- user_addresses: address_id, user_id, province, city, district, detail_address
+
+值映射：
+- "北京" → "北京市" in user_addresses.province
+- "shipped" → "shipped" in orders.order_status
+```
+
+### 输出
+```json
+{{
+  "selected_columns": {{
+    "orders": ["order_no", "order_status", "total_amount", "created_at"],
+    "user_addresses": ["province", "city"]
+  }}
+}}
+```
+
+**说明：**
+- ✅ 选了 orders.order_status（值映射指定）
+- ✅ 选了 user_addresses.province（值映射指定）
+- ✅ 选了 orders.order_no, total_amount, created_at（订单相关信息）
+- ✅ 选了 user_addresses.city（地区相关）
+- ❌ 没选 order_id, user_id（连接键，图谱会补）
+- ❌ 没选 users 表（问题不关心用户信息）
+- ❌ 没选 detail_address（太详细，不需要）
+
+## 注意事项
+
+1. **宁多勿少**：不确定时就选上，不要漏选
+2. **不选连接键**：user_id, order_id 这种外键不用选
+3. **必选值映射列**：value_mappings 里的列必须选
+4. **按表分组输出**：输出格式是 {{"table": ["col1", "col2"]}}
+
+现在开始选列吧！
+"""
+
+
+
 
 GEN_SQL_PROMPT = """
 你是一个资深 SQL 专家，专门处理 SQLite 数据库生成任务。

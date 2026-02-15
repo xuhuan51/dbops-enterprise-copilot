@@ -35,7 +35,7 @@ class SchemaRetriever:
             self,
             query: str,
             db_id: str,
-            top_k: int = 15,
+            top_k: int = 8,
             source_group: str = "GENERAL"
     ) -> List[Dict[str, Any]]:
         """

@@ -89,18 +89,17 @@ class AgentState(TypedDict, total=False):
     expand_data: Optional[ExpandOutput]  # 👈 Expand 填这里 (新加的)
 
     # --- 检索上下文 ---
-    retrieved_tables: List[str]
-    retrieved_columns: List[Any]
-    schema_str: str
+    retrieved_schema: Dict[str, Any]  # 存真实的表结构字典
+    value_mappings: List[Any]  # 存真实的 "北京"->"北京市" 映射
     join_paths: List[str]
     business_rules: List[str]
     value_matches: List[str]
 
-    # 补充上下文
-    schema_context: str
-    rules_context: str
-    constraints_context: str
-    join_paths_context: str
+    # --- 选列阶段(Selection - 精选)---
+    selected_schema: Dict[str, Any]  # 精选后的 Schema (Generator 用这个)
+    selected_tables_list: List[str]  # 选中的表名列表
+    join_paths: List[str]  # 计算出的 JOIN 路径
+    column_selection_reasoning: str  # 选列理由
 
     # --- 生成与验证 ---
     generated_sql: str
