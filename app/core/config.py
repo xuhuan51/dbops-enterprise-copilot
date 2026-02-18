@@ -29,7 +29,7 @@ class Settings:
     # 这里的库名要和你 docker-compose.yml 里的 MYSQL_DATABASE 一致
     DB_NAME = os.getenv("DB_NAME", "ecommerce")
     # 结果限制，防止 select * from big_table 撑爆内存
-    RESULT_MAX_ROWS = int(os.getenv("RESULT_MAX_ROWS", "50"))
+    RESULT_MAX_ROWS = int(os.getenv("RESULT_MAX_ROWS", "1000"))
 
     # 执行超时时间 (秒)，防止死循环 SQL
     SQL_EXEC_TIMEOUT = 10

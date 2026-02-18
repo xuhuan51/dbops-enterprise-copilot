@@ -69,8 +69,8 @@ def validate_and_rewrite(sql: str) -> GuardrailResult:
             return GuardrailResult(False, "Security: 'SELECT ... INTO' is not allowed", None)
 
     # 5. ✅ 只做“文本级 LIMIT 修正”，不动 AST（避免 DESC1000 这类坑）
-    default_limit = int(getattr(settings, "SQL_DEFAULT_LIMIT", 100))
-    max_limit = int(getattr(settings, "SQL_MAX_LIMIT", 1000))
+    default_limit = int(getattr(settings, "SQL_DEFAULT_LIMIT", 1000))
+    max_limit = int(getattr(settings, "SQL_MAX_LIMIT", 2000))
 
     def _strip_trailing_semicolon(s: str) -> tuple[str, str]:
         s2 = s.rstrip()

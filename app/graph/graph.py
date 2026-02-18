@@ -7,7 +7,7 @@ from app.core.state import AgentState
 from app.graph.nodes.router_node import router_node
 from app.graph.nodes.expand_node import expand_node
 from app.graph.nodes.retrieval_node import retrieval_node
-from app.graph.nodes.column_selector_node import column_selector_node
+from app.graph.nodes.context_selector_node import column_selector_node
 from app.graph.nodes.generate_node import generate_node
 from app.graph.nodes.verification_node import verification_node
 from app.graph.nodes.execution_node import execution_node

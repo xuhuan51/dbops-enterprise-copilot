@@ -117,7 +117,7 @@ if __name__ == "__main__":
     is_reload = os.getenv("UVICORN_RELOAD", "False").lower() == "true"
     print(f"🚀 Starting Uvicorn Server (Reload={is_reload})...")
     uvicorn.run(
-        "app.main:app",
+        "main:app",
         host="0.0.0.0",
         port=8000,
         reload=is_reload
