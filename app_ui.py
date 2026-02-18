@@ -1,19 +1,3 @@
-"""
-═══════════════════════════════════════════════════════════════════════════════
-📦 模块名称: app_ui.py (v3 - 精确匹配后端 step 字段)
-📝 说明:
-   完全基于 agent.py v2 推送的 step 字段做精确匹配。
-   后端事件流:
-     ROUTER → RETRIEVAL_START → RETRIEVAL_DONE → SELECTOR_START
-     → SELECTOR_DONE(type=context, payload=详情)
-     → GENERATE_START → GENERATE_DONE(type=sql) / GENERATE_REPAIRED(type=sql)
-     → VERIFY_START → VERIFY_PASS / VERIFY_REJECT
-     → GENERATE_REPAIR_START → ...
-     → EXECUTE_START → EXECUTE_DONE(type=data)
-     → ANALYSIS(type=answer) → ANALYSIS(type=chart)
-═══════════════════════════════════════════════════════════════════════════════
-"""
-
 import streamlit as st
 import requests
 import pandas as pd
@@ -29,7 +13,7 @@ API_URL = "http://127.0.0.1:8000/api/v1/query"
 st.set_page_config(page_title="DBOps Copilot", page_icon="🛡️", layout="wide")
 
 # ==========================================
-# 1. CSS
+# 1. CSS 样式
 # ==========================================
 st.markdown("""
 <style>
@@ -124,19 +108,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 状态
+# 2. 状态管理
 # ==========================================
 if "messages" not in st.session_state:
     st.session_state["messages"] = [{
         "role": "assistant",
-        "content": "👋 **你好！我是 DBOps 智能助手。**\n\n我可以帮你查询数据、分析趋势或生成报表。\n\n**试试问我：**\n- 🔍 *查询最近一个月销售额最高的5个商品*\n- 📊 *统计各品牌销量占比*"
+        "content": "👋 **你好！我是 DBOps 智能助手。**\n\n我可以帮你查询数据、分析趋势或生成报表。\n\n**试一试：**\n- 🔍 *查询最近一个月销售额最高的5个商品*\n- 📊 *统计各品牌销量占比*"
     }]
 if "session_id" not in st.session_state:
     st.session_state["session_id"] = str(uuid.uuid4())
 
 
 # ==========================================
-# 3. SQL 语法高亮
+# 3. 辅助函数：SQL 高亮
 # ==========================================
 def highlight_sql(sql_text: str) -> str:
     if not sql_text:
@@ -162,100 +146,32 @@ def highlight_sql(sql_text: str) -> str:
     return s
 
 
-
 # ==========================================
-# 4. 图表渲染 (增强兼容性 + 调试兜底版)
-# ==========================================
-def render_chart(chart_config):
-    """
-    渲染图表 (最终防爆版：处理 Decimal、自动降序)
-    """
-    if not chart_config:
-        return
-
-    # 1. 结构兼容处理
-    raw_data = chart_config.get("data")
-    if isinstance(raw_data, dict) and ("x_axis_data" in raw_data or "x" in raw_data or "labels" in raw_data):
-        chart_data = raw_data
-    else:
-        chart_data = chart_config
-
-    chart_type = chart_config.get("type", "bar")
-    title = chart_data.get("title", "")
-
-    try:
-        # 2. 字段映射
-        x_data = (chart_data.get("x_axis_data") or chart_data.get("x") or
-                  chart_data.get("labels") or chart_data.get("categories") or [])
-        series_data = (chart_data.get("series_data") or chart_data.get("y") or
-                       chart_data.get("values") or chart_data.get("data") or [])
-
-        if not x_data or not series_data:
-            st.warning("⚠️ 图表数据为空")
-            return
-
-        # 3. 🔥 强力清洗数据 (处理 Decimal 崩溃问题)
-        df = pd.DataFrame({
-            "Label": [str(x) for x in x_data],  # 强转字符串
-            "Value": pd.to_numeric(series_data, errors='coerce').fillna(0).astype(float)  # 强转浮点数
-        })
-
-        # 4. 排序 (数值降序)
-        df = df.sort_values(by="Value", ascending=False).reset_index(drop=True)
-
-        # 5. Plotly 绘图
-        import plotly.graph_objects as go
-
-        n = len(df)
-        # 动态生成渐变色
-        colors = [
-            f'rgb({int(59 + i / (max(n, 1)) * (-43))}, {int(130 + i / (max(n, 1)) * (55))}, {int(246 + i / (max(n, 1)) * (-117))})'
-            for i in range(n)]
-
-        if chart_type == "bar":
-            fig = go.Figure(go.Bar(
-                x=df["Label"],
-                y=df["Value"],
-                marker=dict(color=colors),
-                text=[f'{v:,.0f}' for v in df["Value"]],  # 千分位格式化
-                textposition='outside'
-            ))
-            # 动态高度：如果数据太多(比如42个)，自动拉长图表
-            chart_height = max(450, len(df) * 15) if len(df) > 20 else 450
-
-            fig.update_layout(
-                title=title,
-                height=chart_height,
-                margin=dict(l=20, r=20, t=40, b=80),
-                xaxis_tickangle=-45  # 标签倾斜，防止重叠
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        elif chart_type == "line":
-            st.line_chart(df, x="Label", y="Value")
-
-        else:
-            st.bar_chart(df.set_index("Label"))
-
-    except Exception as e:
-        st.error(f"❌ 图表渲染依然报错: {e}")
-        with st.expander("查看崩溃现场"):
-            st.json(chart_config)
-
-# ==========================================
-# 5. 渲染精选上下文 HTML (从 payload 直接读取)
+# 4. 辅助函数：渲染上下文 (修复了这里缺失的问题)
 # ==========================================
 def render_context_html(ctx: dict) -> str:
     """将后端 SELECTOR_DONE 的 payload 渲染为 HTML"""
     parts = []
+
+    # 兼容处理：有些payload可能是字符串，尝试解析
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except:
+            return f'<div class="ctx-card">{ctx}</div>'
+
+    if not isinstance(ctx, dict):
+        return ""
 
     tables = ctx.get("tables", {})
     if tables:
         html = ""
         for tbl, cols in tables.items():
             html += f'<span class="tag-table">📦 {tbl}</span> '
-            for c in cols:
-                html += f'<span class="tag-col">{c}</span> '
+            # 如果 cols 是列表
+            if isinstance(cols, list):
+                for c in cols:
+                    html += f'<span class="tag-col">{c}</span> '
             html += "<br>"
         parts.append(f'<div class="ctx-card"><h4>🎯 AI 精选的表和列</h4>{html}</div>')
 
@@ -282,7 +198,123 @@ def render_context_html(ctx: dict) -> str:
 
 
 # ==========================================
-# 6. 核心：处理流式响应 (带数据自动补全功能)
+# 5. 图表渲染 (终极修复版：兼容 Dict/List + 长度对齐)
+# ==========================================
+def render_chart(chart_config):
+    """
+    渲染图表 (修复数据格式兼容性问题)
+    """
+    if not chart_config:
+        return
+
+    # 1. 结构兼容处理
+    raw_data = chart_config.get("data")
+    if isinstance(raw_data, dict) and ("x_axis_data" in raw_data or "x" in raw_data or "labels" in raw_data):
+        chart_data = raw_data
+    else:
+        chart_data = chart_config
+
+    chart_type = chart_config.get("type", "bar")
+    title = chart_data.get("title", "")
+
+    try:
+        # 2. 字段映射
+        x_raw = (chart_data.get("x_axis_data") or chart_data.get("x") or
+                 chart_data.get("labels") or chart_data.get("categories") or [])
+
+        y_raw = (chart_data.get("series_data") or chart_data.get("y_axis_data") or
+                 chart_data.get("y") or chart_data.get("values") or
+                 chart_data.get("data") or [])
+
+        # 🛡️ 类型清洗：如果是字典，强制转为列表值
+        if isinstance(x_raw, dict):
+            x_raw = list(x_raw.values())
+        if isinstance(y_raw, dict):
+            y_raw = list(y_raw.values())
+
+        # 再次检查空值
+        if not x_raw or not y_raw:
+            st.warning("⚠️ 图表数据为空，无法渲染")
+            return
+
+        # 🛡️ 长度对齐：取交集长度，防止 Pandas 报错
+        min_len = min(len(x_raw), len(y_raw))
+        if min_len == 0:
+            st.warning("⚠️ 有效数据长度为 0")
+            return
+
+        x_data = x_raw[:min_len]
+        series_data = y_raw[:min_len]
+
+        # 3. 构建 DataFrame
+        df = pd.DataFrame({
+            "Label_Raw": x_data,
+            "Value_Raw": series_data
+        })
+
+        # 4. 数据清洗
+        df["Label"] = df["Label_Raw"].astype(str)
+        # 强力转数字：去掉非数字字符 -> 转 float -> 填充 0
+        df["Value"] = pd.to_numeric(
+            df["Value_Raw"].astype(str).str.replace(r'[^\d\.\-]', '', regex=True),
+            errors='coerce'
+        ).fillna(0.0).astype(float)
+
+        # 5. 排序 (按数值降序)
+        df = df.sort_values(by="Value", ascending=False).reset_index(drop=True)
+
+        # 6. 绘图 (Plotly)
+        import plotly.graph_objects as go
+
+        n = len(df)
+        # 动态配色
+        colors = [
+            f'rgb({int(59 + i / (max(n, 1)) * (-43))}, {int(130 + i / (max(n, 1)) * (55))}, {int(246 + i / (max(n, 1)) * (-117))})'
+            for i in range(n)]
+
+        if chart_type == "bar":
+            fig = go.Figure(go.Bar(
+                x=df["Label"],
+                y=df["Value"],
+                marker=dict(color=colors),
+                text=[f'{v:,.0f}' for v in df["Value"]],  # 整数显示更清爽
+                textposition='outside'
+            ))
+            # 动态高度
+            chart_height = max(450, len(df) * 20) if len(df) > 20 else 450
+
+            fig.update_layout(
+                title=dict(text=title, font=dict(size=16)),
+                height=chart_height,
+                margin=dict(l=20, r=20, t=50, b=100),
+                xaxis_tickangle=-45
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        elif chart_type == "line":
+            st.line_chart(df, x="Label", y="Value")
+
+        elif chart_type == "pie":
+            fig = go.Figure(go.Pie(
+                labels=df["Label"], values=df["Value"],
+                textinfo='label+percent'
+            ))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(df.set_index("Label"))
+
+    except Exception as e:
+        # 打印详细堆栈，方便排查
+        import traceback
+        st.error(f"❌ 图表渲染崩溃: {str(e)}")
+        # 仅在需要时展开
+        with st.expander("查看详细报错信息"):
+            st.text(traceback.format_exc())
+            st.json(chart_config)
+
+
+# ==========================================
+# 6. 核心：处理流式响应
 # ==========================================
 def handle_response(prompt):
     status_container = st.status("🚀 正在处理...", expanded=True)
@@ -301,9 +333,9 @@ def handle_response(prompt):
 
     full_answer = ""
     final_sql = ""
-    is_repaired = False
 
-    # 🔥 新增：用于暂存 SQL 执行结果，供图表自动补全使用
+    # 初始化变量，防止未定义错误
+    last_chart_payload = None
     current_sql_result = None
 
     try:
@@ -331,10 +363,10 @@ def handle_response(prompt):
             msg = data.get("msg", "")
             payload = data.get("payload")
 
-            # ... (前面的步骤 Router -> Verify 保持不变，为了节省篇幅略过) ...
-            # ... 请保留原来代码中 Router 到 Verify_REJECT 的部分 ...
+            # ═══════════════════════════════════════════
+            # 步骤处理逻辑
+            # ═══════════════════════════════════════════
 
-            # ── 1. 意图识别 ──
             if step == "ROUTER":
                 progress_bar.progress(10, text="意图识别...")
                 intent = msg.split(":")[-1].strip() if ":" in msg else "DATA_QUERY"
@@ -383,12 +415,10 @@ def handle_response(prompt):
             elif step == "EXECUTE_START":
                 ph_exec.markdown('<div class="step-active">🚀 <b>执行中...</b></div>', unsafe_allow_html=True)
 
-            # ── 14. 执行完成 (这里要捕获数据！) ──
+            # ── 执行完成：暂存数据 ──
             elif step == "EXECUTE_DONE":
                 progress_bar.progress(92, text="查询完成")
                 row_count = len(payload) if payload else 0
-
-                # 🔥 关键点：保存数据到变量
                 current_sql_result = payload
 
                 ph_exec.markdown(
@@ -402,34 +432,29 @@ def handle_response(prompt):
             elif step == "EXECUTE_ERROR":
                 ph_exec.markdown(f'<div class="step-warn">⚠️ {msg}</div>', unsafe_allow_html=True)
 
-            # ── 16. 最终回答 ──
+            # ── 最终回答 ──
             elif step == "ANALYSIS" and evt_type == "answer":
                 progress_bar.progress(100, text="完成")
                 full_answer = payload or ""
                 answer_box.markdown(full_answer)
                 status_container.update(label="✅ 执行完成", state="complete", expanded=False)
 
-            # ── 17. 图表 (核心自动补全逻辑) ──
+            # ── 图表处理 (自动补全 + 存历史) ──
             elif step == "ANALYSIS" and evt_type == "chart":
                 chart_config = payload
 
-                # 🛠️ 自动救援逻辑
-                # 检查 data 是否为空 (None, {}, 或者 inside key empty)
+                # 自动救援逻辑
                 raw_data = chart_config.get("data")
                 is_data_empty = False
-
-                if not raw_data:
+                if raw_data is None:
                     is_data_empty = True
-                elif isinstance(raw_data, dict) and not raw_data:  # check for {}
+                elif isinstance(raw_data, dict) and not raw_data:
                     is_data_empty = True
 
-                # 如果后端数据为空，但我们手头有 SQL 结果，就自己造数据！
+                # 如果后端数据为空，但前端有 SQL 结果，尝试自动生成
                 if is_data_empty and current_sql_result and len(current_sql_result) > 0:
                     try:
                         df = pd.DataFrame(current_sql_result)
-                        # 简单的启发式算法：
-                        # 1. 找第一个文本列作为 X 轴
-                        # 2. 找第一个数字列作为 Y 轴
                         cols = df.columns.tolist()
                         x_col = None
                         y_col = None
@@ -439,7 +464,7 @@ def handle_response(prompt):
                             if df[c].dtype == 'object' or df[c].dtype == 'string':
                                 x_col = c
                                 break
-                        if not x_col: x_col = cols[0]  # 没找到就用第一列
+                        if not x_col: x_col = cols[0]
 
                         # 找 Numeric 列
                         for c in cols:
@@ -449,16 +474,18 @@ def handle_response(prompt):
                         if not y_col and len(cols) > 1: y_col = cols[1]
 
                         if x_col and y_col:
-                            # 🔥 核心修复：强制转为 float 和 str，防止 Decimal 类型搞崩 Plotly
+                            # 强制转为 list, 剩下的交给 render_chart 里的暴力清洗
                             chart_config["data"] = {
-                                "x_axis_data": df[x_col].astype(str).tolist(),
-                                "series_data": pd.to_numeric(df[y_col], errors='coerce').fillna(0).astype(
-                                    float).tolist(),
+                                "x_axis_data": df[x_col].tolist(),
+                                "series_data": df[y_col].tolist(),
                                 "title": "自动生成的分析图表 (Auto-Generated)"
                             }
-                            st.toast("🔧 检测到后端配置缺失，已自动补全图表数据。", icon="🛡️")
+                            st.toast("🔧 前端已自动补全缺失的图表数据", icon="🛡️")
                     except Exception as e:
                         print(f"Auto-chart failed: {e}")
+
+                # 存入历史前更新变量
+                last_chart_payload = chart_config
 
                 with chart_box:
                     render_chart(chart_config)
@@ -471,7 +498,7 @@ def handle_response(prompt):
         st.session_state["messages"].append({
             "role": "assistant",
             "content": full_answer,
-            "chart": last_chart_payload if 'last_chart_payload' in locals() else payload if step == "ANALYSIS" and evt_type == "chart" else None,
+            "chart": last_chart_payload,
             "sql": final_sql,
         })
 
@@ -498,7 +525,8 @@ with st.sidebar:
         st.markdown("🟢 **知识库**")
     st.markdown("---")
     st.markdown("##### 💡 快捷提问")
-    for q in ["最近一个月销售额最高的5个商品", "统计一下每个品牌的总销售额，并按降序排列", "我想找一下有多少买过'小米 14 PRO'的用户"]:
+    for q in ["最近一个月销售额最高的5个商品", "统计一下每个品牌的总销售额，并按降序排列",
+              "我想找一下有多少买过'小米 14 PRO'的用户"]:
         if st.button(f"📌 {q}", use_container_width=True, key=f"q_{q}"):
             st.session_state["_quick_query"] = q
             st.rerun()
