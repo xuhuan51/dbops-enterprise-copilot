@@ -34,8 +34,7 @@ def validate_and_rewrite(sql: str) -> GuardrailResult:
     if not sql or not sql.strip():
         return GuardrailResult(False, "SQL is empty", None)
 
-    raw_sql = sql.strip()
-
+    raw_sql = sql.strip().replace("\xa0", " ").replace("`", "`")
     try:
         # 1. 解析 SQL（只做安全校验，不用于改写）
         parsed = sqlglot.parse(raw_sql, read="mysql")

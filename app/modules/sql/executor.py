@@ -9,11 +9,11 @@ from typing import Any, Dict, List, Optional
 import aiomysql
 from app.core.config import settings
 from app.core.logger import logger
+from app.modules.sql.guardrail import validate_and_rewrite
 
 # ==========================================
-# 📝 日志配置 (补回来的部分)
+# 📝 日志配置
 # ==========================================
-# 自动定位到项目根目录
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 LOG_PATH = os.path.join(PROJECT_ROOT, "logs", "events.jsonl")
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -22,7 +22,6 @@ os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 def append_event(event: dict):
     """
     将事件追加写入到 logs/events.jsonl
-    被 schema_retriever 等模块依赖
     """
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -32,32 +31,37 @@ def append_event(event: dict):
 
 
 # ==========================================
-# 🔌 连接池管理 (Proxy 专用)
+# 🔌 数据库连接池管理
 # ==========================================
-_proxy_pool: Optional[aiomysql.Pool] = None
+# 🔥 修正 2: 变量名改为 _db_pool (之前是 _proxy_pool)
+_db_pool: Optional[aiomysql.Pool] = None
 
 
-async def get_proxy_pool() -> aiomysql.Pool:
-    global _proxy_pool
-    if _proxy_pool is None:
+async def get_db_pool() -> aiomysql.Pool:
+    """
+    获取数据库连接池 (直连 MySQL)
+    """
+    global _db_pool
+    if _db_pool is None:
         try:
             logger.info(
-                f"🔌 [Executor] Connecting to Proxy -> {settings.PROXY_HOST}:{settings.PROXY_PORT} ({settings.PROXY_LOGIC_DB})")
-            _proxy_pool = await aiomysql.create_pool(
-                host=settings.PROXY_HOST,
-                port=settings.PROXY_PORT,
-                user=settings.PROXY_USER,
-                password=settings.PROXY_PASSWORD,
-                db=settings.PROXY_LOGIC_DB,
+                f"🔌 [Executor] Connecting to MySQL -> {settings.DB_HOST}:{settings.DB_PORT} ({settings.DB_NAME})")
+
+            _db_pool = await aiomysql.create_pool(
+                host=settings.DB_HOST,
+                port=settings.DB_PORT,
+                user=settings.DB_USER,
+                password=settings.DB_PASSWORD,
+                db=settings.DB_NAME,
                 cursorclass=aiomysql.DictCursor,
                 autocommit=True,
                 maxsize=20,
                 connect_timeout=10
             )
         except Exception as e:
-            logger.error(f"❌ [Executor] Failed to create Proxy pool: {e}")
+            logger.error(f"❌ [Executor] Failed to create DB pool: {e}")
             raise e
-    return _proxy_pool
+    return _db_pool
 
 
 # ==========================================
@@ -87,14 +91,24 @@ async def execute_select_async(user_id: str, sql: str, trace_id: str = None) -> 
     clean_data = []
     truncated = False
     err = None
+    final_sql = sql
 
     try:
-        _security_precheck(sql)
-        pool = await get_proxy_pool()
+        # 1. 调用 Guardrail 进行安检和改写
+        check_result = validate_and_rewrite(sql)
+        if not check_result.ok:
+            raise ValueError(f"Guardrail Blocked: {check_result.reason}")
+
+        # 使用改写后的 SQL
+        final_sql = check_result.rewritten_sql
+
+        pool = await get_db_pool()
 
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(sql)
+                # 执行最终 SQL
+                await cur.execute(final_sql)
+
                 limit_n = getattr(settings, "RESULT_MAX_ROWS", 1000)
                 raw_data = await cur.fetchmany(limit_n + 1)
 
@@ -112,10 +126,11 @@ async def execute_select_async(user_id: str, sql: str, trace_id: str = None) -> 
 
     latency_ms = int((time.time() - start) * 1000)
 
-    # 🔥 补回：写入审计日志
+    # 写入审计日志
     append_event({
         "trace_id": trace_id, "user_id": user_id, "route": "QUERY",
-        "sql": sql, "latency_ms": latency_ms, "error": err[:500] if err else None,
+        "origin_sql": sql, "executed_sql": final_sql,
+        "latency_ms": latency_ms, "error": err[:500] if err else None,
         "ts_iso": datetime.utcnow().isoformat(),
     })
 
@@ -126,16 +141,13 @@ async def execute_select_async(user_id: str, sql: str, trace_id: str = None) -> 
 
 
 # ==========================================
-# 🚀 业务逻辑 2: 获取表结构 (Schema Retrieve)
+# 🚀 业务逻辑 2: 获取表结构
 # ==========================================
 async def get_tables_columns(table_names: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    使用 SHOW FULL COLUMNS 绕过 ShardingSphere 空元数据的问题
-    """
     if not table_names:
         return {}
 
-    pool = await get_proxy_pool()
+    pool = await get_db_pool()
     result = {t: [] for t in table_names}
 
     async with pool.acquire() as conn:
@@ -161,19 +173,20 @@ async def get_tables_columns(table_names: List[str]) -> Dict[str, List[Dict[str,
 
 
 # ==========================================
-# 🚀 业务逻辑 3: 字段反查表 (Repair Node)
+# 🚀 业务逻辑 3: 字段反查表
 # ==========================================
 async def search_tables_by_column(column_keyword: str) -> List[str]:
     if not column_keyword: return []
-    pool = await get_proxy_pool()
-    # 依然尝试查 information_schema，万一将来 Server 端开了采集就能用了
+    pool = await get_db_pool()
+
+    # 注意：这里也需要改成 settings.DB_NAME
     sql = "SELECT DISTINCT TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = %s AND COLUMN_NAME LIKE %s LIMIT 5"
     pattern = f"%{column_keyword}%"
     found_tables = []
     try:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(sql, (settings.PROXY_LOGIC_DB, pattern))
+                await cur.execute(sql, (settings.DB_NAME, pattern))
                 rows = await cur.fetchall()
                 found_tables = [row['TABLE_NAME'] for row in rows]
     except Exception:
@@ -186,7 +199,7 @@ async def search_tables_by_column(column_keyword: str) -> List[str]:
 # ==========================================
 async def execute_sql_explain(sql: str, trace_id: str = "N/A"):
     _security_precheck(sql)
-    pool = await get_proxy_pool()
+    pool = await get_db_pool()
     try:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:

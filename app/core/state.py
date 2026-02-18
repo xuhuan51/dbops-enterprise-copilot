@@ -110,6 +110,7 @@ class AgentState(TypedDict, total=False):
 
     # 重试
     retry_count: int
+    execution_retries: int
 
     # --- 执行结果 ---
     execution_result: Optional[List[Dict[str, Any]]]

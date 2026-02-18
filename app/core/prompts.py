@@ -366,180 +366,144 @@ KNOWLEDGE_ANSWER_PROMPT = """
 """
 
 
-
-COLUMN_SELECTOR_PROMPT = """你是一个数据库列选择专家。
-
-你的任务是：基于用户的自然语言问题和**语义分析要求**，从检索到的 Schema 中，**选出生成 SQL 真正需要的表和列**。
-
-## 核心原则
-1. **意图对齐**：仔细阅读【语义分析要求】，如果要求排序(SORT)，必须选排序字段；如果要求过滤(FILTER)，必须选条件字段。
-2. **完整性优先**：必须包含所有查询涉及的列（SELECT、WHERE, GROUP BY, ORDER BY）。
-3. **连接键可选**：主键/外键选不选都行，系统会自动补全。
-4. **必选值映射**：Value Mappings 中提到的列必须选中。
+COLUMN_SELECTOR_PROMPT_V2 = """
+你是一个拥有 20 年经验的**数据库架构师**。
+你的任务是：基于用户的自然语言问题，从数据库 Schema 中，**精准锁定**生成 SQL 所需的最小化表和列集合。
+同时，你需要**识别问题中的实体值**，并判断它们可能对应数据库中的哪个列。
 
 ---
+### 🧠 核心推理思维链
 
-# 用户问题
+#### 1. 实体-表 归属原则
+不要只看关键词匹配，要分析**业务实体**的归属：
+- **用户属性**（性别、年龄、等级） → `users` 表
+- **商品属性**（名称、品牌、规格） → `products` 或 `order_items` 表
+- **交易属性**（金额、时间、状态） → `orders` 表
+- **收货信息**（省份、城市、地址） → `user_addresses` 表
+
+#### 2. SQL 子句全覆盖原则
+选出的列必须能支撑完整的 SQL 语句：
+- **SELECT**: 用户想看什么？
+- **WHERE**: 用户限制了什么？
+- **GROUP BY**: 用户想怎么统计？
+- **ORDER BY**: 用户想怎么排？
+
+#### 3. 事实表与维度表
+如果查询涉及**具体的交易细节**（如"买了某商品"），**必须**选中交易明细表（如 `order_items`）。
+
+#### 4. 实体值定位（关键！）
+识别问题中的**具体值**（地名、人名、产品名、状态值等），判断它们最可能在哪个表的哪个列。
+- "北京" → 大概率在 `user_addresses.province` 或 `user_addresses.city`
+- "华为 Mate 60" → 大概率在 `order_items.product_name` 或 `products.product_name`
+- "已发货" → 大概率在 `orders.order_status`
+- **不要把产品名映射到 gender、status 等无关列！**
+
+---
+### 📝 输入上下文
+
+**1. 用户问题**:
 {question}
 
-## 语义分析要求 (Semantic Requirements - 重要参考!)
+**2. 语义分析**:
 {expand_requirements}
 
-## 检索到的表和列 (Context)
+**3. 检索到的 Schema**:
 {retrieved_schema}
 
-## 值映射提示 (Value Mappings)
-{value_mappings}
-
-## 业务规则 (Business Rules)
+**4. 业务规则**:
 {business_rules}
 
 ---
+### 📤 输出要求
 
-请根据上述信息，输出选中的列。
-## 选列策略
-
-### ✅ 必选列
-
-- **目标列**：用户想查询的字段（SELECT 子句）
-  - 例如："订单有哪些？" → 订单号、订单状态等订单信息
-
-- **筛选列**：出现在过滤条件里的字段（WHERE 子句）
-  - 例如："北京的订单" → 地区相关的列
-  - 例如："已发货的订单" → 订单状态列
-
-- **分组列**：用于聚合的维度字段（GROUP BY 子句）
-  - 例如："各地区的订单数量" → 地区列
-
-- **排序列**：用于排序的字段（ORDER BY 子句）
-  - 例如："按金额排序" → 金额列
-
-- **值映射指定的列**：如果 value_mappings 里提到某列，必选！
-
-### ⚠️ 可选列（不确定时就选上）
-
-- **相关字段**：与查询主题相关的列
-  - 例如：查订单，可能需要订单编号、订单时间、订单金额等
-
-- **辅助信息**：可能用于展示的列
-  - 例如：用户名、商品名称等
-
-### ❌ 可以不选的列
-
-- **完全无关**：与问题毫无关系的列
-  - 例如：查订单，不需要商品的库存预警阈值
-
-
-## 值映射的作用
-
-如果提供了 `value_mappings`，说明这些列有明确的筛选条件：
-- 例如："北京" → "北京市" in user_addresses.province
-- **你必须选中 user_addresses 表的 province 列！**
-
-## 输出要求
-
-严格按照以下 JSON Schema 输出：
+请输出一个纯 JSON 对象，格式如下：
 ```json
 {{
+  "reasoning": "简短说明为什么选这些表和列",
   "selected_columns": {{
-    "orders": ["order_no", "order_status", "total_amount"],
-    "user_addresses": ["province", "city"]
-  }}
+    "table_name_1": ["col1", "col2"],
+    "table_name_2": ["col3", "col4"]
+  }},
+  "entity_columns": [
+    {{
+      "value": "北京",
+      "candidate_columns": [
+        {{"table": "user_addresses", "column": "province"}},
+        {{"table": "user_addresses", "column": "city"}}
+      ]
+    }},
+    {{
+      "value": "华为 Mate 60",
+      "candidate_columns": [
+        {{"table": "order_items", "column": "product_name"}}
+      ]
+    }}
+  ]
 }}
 ```
 
-### 字段说明
+### entity_columns 规则：
+1. 只提取**具体的值**（地名、产品名、状态值等），不要提取通用概念（如"订单"、"用户"）
+2. 每个值给出 1~2 个最可能的候选列
+3. 候选列**必须**出现在 selected_columns 中
+4. 如果问题中没有具体实体值，entity_columns 返回空列表 `[]`
 
-- `selected_columns`: 对象，key 是表名，value 是该表选中的列名数组
-- **不需要 reason 字段**，直接给出选择结果即可
+### 注意事项
+1. **宁多勿少**：不确定时就选上
+2. **不选连接键**：user_id, order_id 这种外键不用选（图谱会自动补）
+3. **按表分组输出**
 
-## 示例
-
-### 输入
-```
-问题：北京已发货的订单有哪些？
-
-检索到的表：
-- orders: order_id, order_no, order_status, total_amount, user_id, created_at
-- users: user_id, user_name, phone, email
-- user_addresses: address_id, user_id, province, city, district, detail_address
-
-值映射：
-- "北京" → "北京市" in user_addresses.province
-- "shipped" → "shipped" in orders.order_status
-```
-
-### 输出
-```json
-{{
-  "selected_columns": {{
-    "orders": ["order_no", "order_status", "total_amount", "created_at"],
-    "user_addresses": ["province", "city"]
-  }}
-}}
-```
-
-**说明：**
-- ✅ 选了 orders.order_status（值映射指定）
-- ✅ 选了 user_addresses.province（值映射指定）
-- ✅ 选了 orders.order_no, total_amount, created_at（订单相关信息）
-- ✅ 选了 user_addresses.city（地区相关）
-- ❌ 没选 order_id, user_id（连接键，图谱会补）
-- ❌ 没选 users 表（问题不关心用户信息）
-- ❌ 没选 detail_address（太详细，不需要）
-
-## 注意事项
-
-1. **宁多勿少**：不确定时就选上，不要漏选
-2. **不选连接键**：user_id, order_id 这种外键不用选
-3. **必选值映射列**：value_mappings 里的列必须选
-4. **按表分组输出**：输出格式是 {{"table": ["col1", "col2"]}}
-
-现在开始选列吧！
+现在开始！
 """
 
 
 
 
 GEN_SQL_PROMPT = """
-你是一个资深 SQL 专家，专门处理 SQLite 数据库生成任务。
-你的目标：生成逻辑正确、且能在 SQLite 环境下精准计算数值的结构化 SQL。
+你是一个资深 MySQL 专家，专门处理复杂电商业务数据的 SQL 生成任务。
+你的目标：基于提供的 Schema 和业务规则，生成逻辑准确、可执行的 MySQL 8.0+ SQL 语句。
 
 ========================
-### ✅ SQLite 核心计算与引用规范（最高执行准则）
-1. **数据库引擎：SQLite**
+### ✅ MySQL 核心语法与最佳实践（最高执行准则）
+1. **数据库引擎：MySQL 8.0+**
 2. **标识符引用 (Identifier Quoting)**：
-   - 必须对**所有**列名和表名使用 **双引号** (`"col_name"`)。
-3. **数值计算 (Numeric Precision)**：
-   - **浮点数除法补丁**：SQLite 执行 `INT / INT` 会截断小数。在执行除法时，分子必须显式转换为浮点数。
-   - **公式模板**：`(CAST("num_col" AS REAL) / NULLIF("den_col", 0))`。
-4. **分页与过滤**：
-   - 使用 `LIMIT n` 处理 TopK 问题。
-   - 日期处理使用 `date()`, `datetime()` 或 `strftime()`。
+   - 必须对**所有**表名和列名使用 **反引号** (e.g., `order_id`, `users`)，严禁使用双引号。
+3. **日期与时间处理**：
+   - 获取当前时间：使用 `NOW()` 或 `CURDATE()`。
+   - 时间推算：使用 `DATE_SUB(NOW(), INTERVAL 3 MONTH)` 或 `DATE_ADD(...)`。
+   - ❌ 严禁使用 SQLite 的 `strftime` 或 `datetime(..., '-3 days')` 写法。
+4. **数值计算**：
+   - 涉及金额除法（如客单价）时，请使用 `NULLIF` 防止除以零：`amount / NULLIF(quantity, 0)`。
+   - 货币/金额通常保留两位小数：`ROUND(val, 2)`。
+5. **字符串匹配**：
+   - 模糊查询使用 `LIKE '%pattern%'`。
+   - 区分大小写取决于排序规则，但通常 SQL 关键字大写，标识符小写。
 
 ========================
-### ✅ Join Hard Rules（与上面同级，最高优先级，必须严格遵守）
-- **MUST**：如果两张表都存在 `"CDSCode"`（或同义字段如 `"cds"`），你必须使用它作为 JOIN Key。
-- **NEVER**：在 `"CDSCode"` JOIN 可用时，禁止使用 `"District Name"`、`"School Name"` 等非唯一字段作为 JOIN Key。
-- **Fallback**：只有当相关表**不存在**可用的 `"CDSCode"/"cds"` 连接键时，才允许使用其他键 JOIN，并在审计清单中用一句话说明原因。
+### ✅ Join Hard Rules (电商数据关联法则)
+- **ID 优先**：表之间通常通过 `_id` 后缀字段连接（如 `user_id`, `order_id`, `sku_id`）。
+- **必须使用外键**：schema_context 中提供的 JSON 结构里，如果暗示了 Foreign Key，必须优先使用。
+- **避免笛卡尔积**：严禁在没有 JOIN 条件的情况下多表查询。
 
-## [1. 数据库 Schema]
+========================
+### [1. 数据库 Schema (JSON Format)]
+下面是数据库的结构定义，包含表名、列名、数据类型及**核心业务含义**：
 {schema_context}
 
 ### [2. 🔴 核心法则与强制约束 (CRITICAL RULES & CONSTRAINTS)]
-⚠️ **警告：以下是绝对指令，违背任何一条都将导致任务失败。请逐条核对！**
+⚠️ **警告：以下是绝对指令，违背任何一条都将导致任务失败。**
 
 **A. 业务逻辑与计算规则 (Business Logic):**
 {rules_context}
-*(这里放入知识库检索出的规则，比如 "Don't divide count by enrollment")*
+*(例如：统计销售额时通常需要过滤 status='PAID' 或 'COMPLETED' 的订单；未支付订单不计入 GMV)*
 
 **B. 必须满足的过滤条件 (Mandatory Filters):**
 {constraints_context}
-*(这里放入 Value Matching 找出的具体值，比如 "Year = 2023")*
+*(这里是根据用户提问提取出的具体值，例如：Province = '北京', Category = 'Electronics')*
 
 **C. 结构化连接路径 (Join Paths):**
 {join_paths_context}
-*(这里放入图算法算出的路径，比如 "Use CDSCode to join")*
+*(参考图算法推荐的路径进行 JOIN，例如：orders -> order_items -> products)*
 
 ### [3. 🌟 参考案例 (Few-Shot)]
 {few_shot_context}
@@ -549,44 +513,35 @@ GEN_SQL_PROMPT = """
 当前问题: {question}
 
 ========================
-### ✅ 输出要求（不要输出 JSON）
-你必须严格按以下格式输出两部分：
+### ✅ 输出要求
+⚠️ **警告：你必须且只能输出 SQL 代码块。**
+1. **禁止** 输出任何解释、开场白或结束语。
+2. **禁止** 在 SQL 块之外输出任何文字。
 
-第一部分：输出“审计清单”（4 行以内，禁止展开长推理）
-```audit
-- Join: （说明你使用了哪个 join key；）
-- Filter: （列出关键过滤条件，必须与 constraints_context 一致）
-- Calc: （如有除法，说明已 CAST 为 REAL 并做 NULLIF）
-- Quote: （确认所有表名/列名都使用双引号）
-
-
-第二步：输出 SQL 代码
-```sql
+```
 SELECT ...
-
+```
 ========================
-
 ❗重要提醒
 
-你只能使用 schema_context 中出现的表与列。
+你只能使用 {schema_context} 中显式存在的表与列，不要幻觉发明字段（如不要臆造 is_paid，如果表里只有 status）。
 
-不要发明列名。
+如果问题涉及“最近/最新”，请使用 ORDER BY date_col DESC LIMIT 1。
 
-请严格遵守核心法则与强制约束。
+如果问题涉及“前 N 个”，请使用 LIMIT N。
 
-如果存在多条满足条件的记录：
-
-“最高/最大/最低”类问题必须使用 ORDER BY ... DESC/ASC LIMIT 1（或等价写法），避免 WHERE = (SELECT MAX(...)) 造成并列不确定性。
-
+再次强调：使用反引号 ` 引用字段名。
 ========================
 """
 
-SQL_REFLECTION_PROMPT = r"""
-你是一名**理性且具备高级逻辑的 SQL 审查员（SQL Reviewer）**。
-任务：判断 SQL 是否在当前 Schema 和业务规则约束下，**准确、简洁**地回答了用户问题。
+
+
+SQL_REFLECTION_PROMPT = """
+你是一名**严格的 MySQL 代码审查员 (Code Reviewer)**。
+你的目标是确保生成的 SQL 在 MySQL 8.0+ 环境下逻辑正确、语法合规，并且精准回答了用户的问题。
 
 ======================
-1. 🆕 核心审查对象：当前 SQL (CURRENT SQL)
+1. 待审查 SQL
 ======================
 {sql}
 
@@ -596,60 +551,47 @@ SQL_REFLECTION_PROMPT = r"""
 {question}
 
 ======================
-3. 历史反馈 (仅供参考，若 SQL 已修复则忽略)
+3. 数据库 Schema (真实存在的表与列)
+======================
+{schema_context}
+
+======================
+4. 业务规则
+======================
+{business_rules}
+
+======================
+5. 历史反馈 (若 SQL 已修复则忽略)
 ======================
 {history_context}
 
 ======================
-4. 审查依据 (Schema & Rules)
+🚨 核心审查标准 (Checklist)
 ======================
-Schema 证据：
-{schema_context}
+1. **幻觉检查 (Hallucination Check)**:
+   - **FAIL**: 如果 SQL 使用了 `schema_context` 中不存在的列名或表名。
+   - **FAIL**: 如果 SQL 编造了不存在的外键关联。
 
-业务规则：
-{business_rules}
+2. **MySQL 语法检查**:
+   - **FAIL**: 使用了 SQLite 的 `strftime` 或 `date('now')`。(应使用 `DATE_FORMAT`, `NOW()`, `DATE_SUB`)
+   - **FAIL**: 使用了双引号 `"` 引用字段。(MySQL 推荐使用反引号 `` ` `` 或不使用引号)
+   - **PASS**: 使用 `LIMIT` 进行分页或 Top-K。
 
-======================
-核心审查原则
-======================
-1. **语义映射优先**：若业务规则已将术语映射为列，SQL 正确使用该列即视为合规。
-2. **禁止样本幻觉**：除非明确要求模糊搜索，否则禁止根据样本内容建议 LIKE 操作。
-3. **最小代价原则**：只要 SQL 能产生正确结果，不要因为“写法风格”而 Fail。
-4. **语义封装优先 (New)**：如果一个“专有列”能同时表达多个条件（如 "Charter Funding Type" 同时包含 Charter 和 Funding 信息），优先认可该列，而不是强迫 SQL 使用 `AND` 拆分逻辑。
+3. **逻辑完整性**:
+   - **FAIL**: 问题询问“销售额 (GMV)”，但 SQL 只是 `COUNT(*)` (订单量)。
+   - **FAIL**: 缺少必要的 `WHERE` 过滤（例如未过滤 `status='PAID'`，除非业务规则说不需要）。
+   - **FAIL**: 多表 JOIN 时没有 ON 条件（导致笛卡尔积）。
 
-======================
-硬性审查清单（必须检查所有项）
-======================
-
-1) 🚨 事实与规则的优先级裁决 (Schema Evidence vs. Business Rules)
-   - **Schema 事实绝对优先**：如果【业务规则】强制要求使用“列 A”，但 SQL 使用了【Schema】中存在的“列 B”，且“列 B”在语义上能更精准、更直接地回答用户问题（例如：列 B 是一个专有的复合字段，而列 A 是通用字段），**请判定为 PASS**。严禁教条地因为“没用规则指定的列”而报错。
-   - **样本值权威性**：如果【业务规则】声称字段值应为某种格式（如全大写），但【Schema 样本】显示实际存储的是另一种格式（如小写或首字母大写），**请以 Schema 样本为准**。数据库里的真实数据是最高真理。
-   - **语义覆盖**：若 SQL 使用的列能够覆盖问题的语义，严禁要求对该列进行不必要的字面量拆分或死板过滤。
-   - **字段确定性**：必须且只能使用 schema_context 中存在的列。
-
-2) 🚨 过滤逻辑完备性 (Filter Completeness)
-   - **显式条件**：用户问题中的显式限定词，SQL 必须有对应的逻辑。
-   - **语义封装豁免 (Semantic Encapsulation)**：如果 SQL 使用了一个“专有列”或“复合列”，该列的命名或定义已经能够完整涵盖用户问题中的多个限定词（例如：一个列名同时包含了“类型”和“状态”两个概念），则**不需要**再为每个词单独添加过滤条件。不要因为 SQL 看起来“少了一个条件”就报错，要看该列的语义是否已包含这些概念。
-   - **关联准确性**：必须使用正确的主外键进行 JOIN。
-
-3) 🚨 极值与唯一性 (Top-K / Uniqueness)
-   - 涉及“最高/最少/排序”必须有 `ORDER BY`。
-
-4) 🚨 数量 vs 比例 (Metric Alignment)
-   - 问“数量”用 COUNT，问“比例”用除法。
-
-5) 🚨 历史与事实核查 (History & Fact Check)
-   - **视觉事实核查**：在提出批评之前，请先用“肉眼”扫描一遍 **当前 SQL**。如果 Generator 已经修复了历史指出的错误（例如已经加了 JOIN，或者已经改了列名），**严禁**盲目重复旧的批评！
-   - **冲突裁决**：若【历史建议】与【Schema 证据】（如列名是否存在、样本值格式）冲突，**以 Schema 证据为准**。
-   - **禁止摇摆**：避免“上一轮说 A，这一轮改回 B”的反复折磨。如果当前 SQL 在逻辑上是通的，且符合 Schema 事实，就让它过。
+4. **样本值匹配**:
+   - **FAIL**: `WHERE column = 'Value'` 中的值与 Schema 中的 Samples 格式明显不符（如大小写、缩写）。
 
 ======================
-输出（严格 JSON）
+输出格式 (JSON Only)
 ======================
-请检查上述所有清单项。如果发现多个错误，请在 feedback 中汇总列出。
+请仅输出 JSON，不要包含 Markdown 或其他文字：
 {{
   "status": "PASS" 或 "FAIL",
-  "feedback": "若 FAIL：请按顺序通过序号列出**所有**发现的问题。注意：如果发现 SQL 用了多个 AND 条件来拼凑一个概念，而 Schema 中有更具体的专有列，请明确建议更换为该专有列（例如：'建议使用 frpm.Charter Funding Type 替换 schools.FundingType'）。"
+  "feedback": "如果 FAIL，请简要说明原因，并给出具体的 MySQL 修正建议（如：'请将 strftime 替换为 DATE_FORMAT'，或 '表 users 中没有 is_active 列，请检查 schema'）。如果 PASS，请留空。"
 }}
 """
 
