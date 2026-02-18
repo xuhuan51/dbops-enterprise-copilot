@@ -19,7 +19,7 @@ from app.core.logger import logger
 from app.core.state import AgentState
 from app.graph.nodes.expand_node import llm
 from app.modules.retrieval.graph.service import graph_service
-from app.modules.retrieval.schema.value_linker import match_values_from_samples
+from app.modules.retrieval.schema.value_linker import match_values_with_fallback
 
 
 # =============================================================================
@@ -48,10 +48,103 @@ class ColumnSelectorOutput(BaseModel):
     reasoning: str = Field(..., description="简述选列理由")
 
 
+# =============================================================================
+# 2. Prompt 模板 —— 新增 entity_columns 输出要求
+# =============================================================================
+
+COLUMN_SELECTOR_PROMPT_V2 = """
+你是一个拥有 20 年经验的**数据库架构师**。
+你的任务是：基于用户的自然语言问题，从数据库 Schema 中，**精准锁定**生成 SQL 所需的最小化表和列集合。
+同时，你需要**识别问题中的实体值**，并判断它们可能对应数据库中的哪个列。
+
+---
+### 🧠 核心推理思维链
+
+#### 1. 实体-表 归属原则
+不要只看关键词匹配，要分析**业务实体**的归属：
+- **用户属性**（性别、年龄、等级） → `users` 表
+- **商品属性**（名称、品牌、规格） → `products` 或 `order_items` 表
+- **交易属性**（金额、时间、状态） → `orders` 表
+- **收货信息**（省份、城市、地址） → `user_addresses` 表
+
+#### 2. SQL 子句全覆盖原则
+选出的列必须能支撑完整的 SQL 语句：
+- **SELECT**: 用户想看什么？
+- **WHERE**: 用户限制了什么？
+- **GROUP BY**: 用户想怎么统计？
+- **ORDER BY**: 用户想怎么排？
+
+#### 3. 事实表与维度表
+如果查询涉及**具体的交易细节**（如"买了某商品"），**必须**选中交易明细表（如 `order_items`）。
+
+#### 4. 实体值定位（关键！）
+识别问题中的**具体值**（地名、人名、产品名、状态值等），判断它们最可能在哪个表的哪个列。
+- "北京" → 大概率在 `user_addresses.province` 或 `user_addresses.city`
+- "华为 Mate 60" → 大概率在 `order_items.product_name` 或 `products.product_name`
+- "已发货" → 大概率在 `orders.order_status`
+- **不要把产品名映射到 gender、status 等无关列！**
+
+---
+### 📝 输入上下文
+
+**1. 用户问题**:
+{question}
+
+**2. 语义分析**:
+{expand_requirements}
+
+**3. 检索到的 Schema**:
+{retrieved_schema}
+
+**4. 业务规则**:
+{business_rules}
+
+---
+### 📤 输出要求
+
+请输出一个纯 JSON 对象，格式如下：
+```json
+{{
+  "reasoning": "简短说明为什么选这些表和列",
+  "selected_columns": {{
+    "table_name_1": ["col1", "col2"],
+    "table_name_2": ["col3", "col4"]
+  }},
+  "entity_columns": [
+    {{
+      "value": "北京",
+      "candidate_columns": [
+        {{"table": "user_addresses", "column": "province"}},
+        {{"table": "user_addresses", "column": "city"}}
+      ]
+    }},
+    {{
+      "value": "华为 Mate 60",
+      "candidate_columns": [
+        {{"table": "order_items", "column": "product_name"}}
+      ]
+    }}
+  ]
+}}
+```
+
+### entity_columns 规则：
+1. 只提取**具体的值**（地名、产品名、状态值等），不要提取通用概念（如"订单"、"用户"）
+2. 每个值给出 1~2 个最可能的候选列
+3. 候选列**必须**出现在 selected_columns 中
+4. 如果问题中没有具体实体值，entity_columns 返回空列表 `[]`
+
+### 注意事项
+1. **宁多勿少**：不确定时就选上
+2. **不选连接键**：user_id, order_id 这种外键不用选（图谱会自动补）
+3. **按表分组输出**
+
+现在开始！
+"""
 
 
 # =============================================================================
-# 2. 辅助格式化函数
+# 3. 辅助格式化函数
 # =============================================================================
 
 def _format_schema_for_llm(retrieved_schema: dict) -> str:
@@ -286,12 +379,13 @@ async def column_selector_node(state: AgentState) -> AgentState:
         # 将 Pydantic 对象转为 dict 列表
         entity_columns_raw = [ec.model_dump() for ec in response.entity_columns]
 
-        # 用 sample_values 做 LCS 匹配（不额外查数据库）
-        matches = match_values_from_samples(
+        # 🔥 分层匹配：sample_values 快速通道 + DB LIKE 兜底
+        matches = await match_values_with_fallback(
             entity_columns=entity_columns_raw,
             selected_schema=selected_schema_full,
             min_score=70.0,
             top_k=5,
+            enable_db_fallback=True,  # 开启数据库兜底
         )
 
         if matches:

@@ -120,3 +120,7 @@ class AgentState(TypedDict, total=False):
     # --- 最终输出 ---
     final_answer: Optional[str]
     final_result: Any
+
+    # === 👇 新增字段 ===
+    final_answer: Optional[str]  # AI 的自然语言总结
+    visualization_config: Optional[Dict]  # 前端图表配置 (ECharts/AntV 标准)

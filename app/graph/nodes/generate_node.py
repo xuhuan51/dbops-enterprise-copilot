@@ -91,25 +91,23 @@ def _format_value_mappings_for_sql(value_mappings: List[Dict]) -> str:
     """
     将 value_mappings 格式化为 SQL 生成器能直接使用的提示
 
-    输入 (来自 column_selector_node / value_linker):
-    [
-        {"user_input": "北京", "db_value": "北京市", "table": "user_addresses", "column": "province"},
-        {"user_input": "华为 Mate 60", "db_value": "华为 Mate 60", "table": "order_items", "column": "product_name"}
-    ]
+    支持两种操作符：
+    - "=" : 精确匹配，直接用数据库值
+    - "LIKE" : 模糊匹配，用 LIKE 模式
 
-    输出:
+    输出示例:
     ⚠️ IMPORTANT: Use the exact database values below in your WHERE clauses:
-    - User said "北京", but the actual value in `user_addresses`.`province` is '北京市'
-      → Use: WHERE `user_addresses`.`province` = '北京市'
-    - User said "华为 Mate 60", the actual value in `order_items`.`product_name` is '华为 Mate 60'
-      → Use: WHERE `order_items`.`product_name` = '华为 Mate 60'
+    - User said "北京" → USE: WHERE `user_addresses`.`province` = '北京市'
+    - User said "小米 14 PRO", multiple DB matches found:
+      ['小米14 Pro 旗舰版', '小米14 Pro版', '小米14 Pro 新款']
+      → USE: WHERE `order_items`.`product_name` LIKE '%小米14 Pro%'
     """
     if not value_mappings:
         return "No value mappings. Use values as mentioned in the question."
 
     lines = [
         "⚠️ IMPORTANT: The user's wording may differ from actual database values.",
-        "Use the EXACT database values below in your WHERE clauses:\n"
+        "Use the EXACT database values or patterns below in your WHERE clauses:\n"
     ]
 
     for m in value_mappings:
@@ -117,18 +115,32 @@ def _format_value_mappings_for_sql(value_mappings: List[Dict]) -> str:
         db_value = m.get("db_value", "")
         table = m.get("table", "")
         column = m.get("column", "")
+        operator = m.get("suggest_operator", "=")
+        all_values = m.get("all_db_values", [])
 
-        if user_input == db_value:
+        if operator == "LIKE":
+            # 模糊匹配模式
             lines.append(
-                f'- "{user_input}" → `{table}`.`{column}` = \'{db_value}\''
+                f'- User said "{user_input}", multiple DB matches found in `{table}`.`{column}`:'
+            )
+            if all_values:
+                lines.append(f'  Matched values: {all_values}')
+            lines.append(
+                f"  → USE: WHERE `{table}`.`{column}` LIKE '{db_value}'"
             )
         else:
-            lines.append(
-                f'- User said "{user_input}", but actual DB value in `{table}`.`{column}` is \'{db_value}\''
-            )
-            lines.append(
-                f'  → USE: WHERE `{table}`.`{column}` = \'{db_value}\''
-            )
+            # 精确匹配模式
+            if user_input == db_value:
+                lines.append(
+                    f'- "{user_input}" → `{table}`.`{column}` = \'{db_value}\''
+                )
+            else:
+                lines.append(
+                    f'- User said "{user_input}", but actual DB value in `{table}`.`{column}` is \'{db_value}\''
+                )
+                lines.append(
+                    f'  → USE: WHERE `{table}`.`{column}` = \'{db_value}\''
+                )
 
     return "\n".join(lines)
 

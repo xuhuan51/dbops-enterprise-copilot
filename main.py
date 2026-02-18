@@ -1,80 +1,124 @@
 import time
 import os
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+from app.api.v1.agent import router
 
-# 1. 引入 RAG 相关的单例 (Core 层)
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("main")
+
+# ==========================================
+# 2. Core 组件引入 (带容错处理)
+# ==========================================
+HAS_RAG = False
 try:
     from app.core.rag_store import rag_store
-    from app.core.embedding import embedder  # ✅ 新增
+    from app.core.embedding import embedder
     from app.core.reranker import reranker
-    # 假设你的 retrieve_router 在这里
-    from app.api.v1.retrieve_tables import router as retrieve_router
 
-    HAS_RETRIEVE = True
+    HAS_RAG = True
 except ImportError as e:
-    print(f"⚠️ RAG Import Warning: {e}")
-    HAS_RETRIEVE = False
+    logger.warning(f"⚠️ RAG Core components import failed: {e}")
+    logger.warning("⚠️ System will run in degraded mode (No RAG support).")
 
 
+# ==========================================
+# 3. 生命周期管理 & 模型预热 (Lifespan)
+# ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("\n🔥 [Startup] System is warming up...")
-    t0 = time.perf_counter()
+    """
+    🔥 系统启动预热逻辑
+    """
+    logger.info("🔥 [Startup] System warming up...")
+    start_time = time.perf_counter()
 
-    if HAS_RETRIEVE:
+    if HAS_RAG:
         try:
-            print("   🛠️  Initializing Milvus connection...")
-            # 这一步会触发 Milvus 连接
-            # rag_store 是单例，只要访问它，它内部的 __init__ 就会跑
-            # 而 rag_store.__init__ 现在会调用 embedder.dimension，进而触发模型加载
-            _ = rag_store.schema_col
-            print("   ✅ Milvus connected & Schema loaded.")
+            # --- A. 激活 Milvus 连接 ---
+            logger.info("   🛠️  Checking Milvus connection...")
+            if hasattr(rag_store, "schema_col"):
+                _ = rag_store.schema_col
+            logger.info("      ✅ Milvus connected.")
 
-            # 如果你想显式预热 Embedding (虽然上面一行可能已经触发了)
-            print("   🧠 Pre-loading Embedding model...")
-            embedder.load_model()
+            # --- B. 预热 Embedding 模型 ---
+            logger.info("   🧠 Warming up Embedding Model...")
+            _ = embedder.encode(["warmup_query"])
+            logger.info("      ✅ Embedding Model warmed up.")
 
-            # 显式预热 Reranker
-            print("   ⚖️  Pre-loading Rerank model...")
-            reranker._load_model()  # 触发加载
+            # --- C. 预热 Reranker 模型 ---
+            logger.info("   ⚖️  Warming up Reranker Model...")
+            try:
+                if hasattr(reranker, "compute_score"):
+                    _ = reranker.compute_score([["warmup_query", "warmup_doc"]])
+                elif hasattr(reranker, "predict"):
+                    _ = reranker.predict([["warmup_query", "warmup_doc"]])
+                logger.info("      ✅ Reranker Model warmed up.")
+            except Exception:
+                pass
 
         except Exception as e:
-            print(f"   ⚠️ RAG Warmup skipped or failed: {e}")
+            logger.error(f"❌ [Startup Error] RAG Warmup failed: {e}")
     else:
-        print("   ⏩ RAG module disabled.")
+        logger.info("   ⏩ RAG module disabled/missing, skipping warmup.")
 
-    elapsed = time.perf_counter() - t0
-    print(f"✅ [Startup] Ready! Took {elapsed:.2f}s\n")
+    elapsed = time.perf_counter() - start_time
+    logger.info(f"✅ [Startup] System Ready! Warmup took {elapsed:.2f}s")
 
     yield
 
-    print("🛑 [Shutdown] Cleaning up...")
+    logger.info("🛑 [Shutdown] Cleaning up resources...")
 
 
-app = FastAPI(title="dbops-enterprise-copilot", lifespan=lifespan)
+# ==========================================
+# 4. FastAPI App 定义
+# ==========================================
+app = FastAPI(
+    title="DBOps Enterprise Copilot",
+    description="Text-to-SQL Agent with RAG & Visualization",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
+# 配置 CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-if HAS_RETRIEVE:
-    app.include_router(retrieve_router, prefix="/api/v1")
+# ==========================================
+# 5. 🔗 挂载路由 (这就是连接 Agent 的地方)
+# ==========================================
+# 这里把你的 api.py (api_router) 接到了 /api/v1 路径下
+# 最终访问地址: http://localhost:8000/api/v1/query
+app.include_router(router, prefix="/api/v1", tags=["Agent Chat"])
 
 
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health_check():
+    return {"status": "ok", "rag_enabled": HAS_RAG}
 
 
+# ==========================================
+# 6. 启动入口
+# ==========================================
 if __name__ == "__main__":
-    # 获取环境变量，如果没有设置，默认为 False (关闭热重载以稳定调试)
     is_reload = os.getenv("UVICORN_RELOAD", "False").lower() == "true"
-    print(f"🚀 Starting Uvicorn with reload={is_reload}")
-
+    print(f"🚀 Starting Uvicorn Server (Reload={is_reload})...")
     uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
+        "app.main:app",
+        host="0.0.0.0",
         port=8000,
         reload=is_reload
     )
