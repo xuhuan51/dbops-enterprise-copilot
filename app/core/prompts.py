@@ -399,22 +399,20 @@ COLUMN_SELECTOR_PROMPT = """
 - "已发货" → 大概率在 `orders.order_status`
 - **不要把产品名映射到 gender、status 等无关列！**
 
-#### 5. 业务规则筛选（关键！）
-业务规则来自 RAG 检索，**可能包含与当前查询无关的规则**。你必须逐条判断每条规则的相关性：
-- **required**: 该规则与当前查询直接相关，必须遵守。
-  例如：用户问"销售额"，规则说"计算销售额必须过滤cancelled/refunded" → required
-- **optional**: 该规则与当前查询间接相关，可作为参考但不强制。
-  例如：用户问"销售额最高的商品"，规则说"需要关联brands表" → 用户没要求品牌信息，optional
-- **irrelevant**: 该规则与当前查询完全无关。
-  例如：用户问"销售额"，规则说"统计销量时用sales_count" → irrelevant（问的是销售额不是销量）
+#### 5. 规则-列 强制绑定原则（⭐⭐⭐ 核心机制）
+**这是最关键的一步！**
+很多业务规则包含了隐式的过滤逻辑（例如："统计有效订单" -> 规则提及需检查 `order_status`）。
+**判定逻辑：**
+- 如果你将某条规则标记为 **required** 或 **optional**。
+- 那么，你 **必须且强制** 将该规则文本中明确提及的**物理字段**（如 `order_status`, `is_active`, `payment_method`）加入到 `selected_columns` 中。
+- **绝对禁止**：觉得规则相关，却不选对应的列（这会导致下游 SQL 生成器因找不到字段而幻觉报错）。
 
-**判断标准**：
-- 规则中的**计算方式、过滤条件**与用户查询的指标直接相关 → required
-- 规则中提到的**表关联**，但用户没有要求相关维度信息 → optional
-- 规则涉及的**指标/场景**与用户查询完全不同 → irrelevant
-
-⚠️ 如果一条规则是 required，那么该规则涉及的所有字段都必须出现在 selected_columns 中！
-
+#### 6. 规则分类前的强制检查（⭐⭐⭐ 在分类之前必须执行）
+在对每条规则标记 relevance 之前，先回答这两个问题：
+Q1: 当前查询是否涉及 orders 表或与订单相关的统计（销售额、消费、购买、下单）？
+    → 如果是，则"排除 cancelled/refunded"和"使用 actual_amount"的规则 **必须标记为 required**。
+Q2: 规则原文是否包含"必须"、"务必"、"请务必"等强制性措辞？
+    → 如果是，则 **必须标记为 required**，不管用户有没有明确提到。
 ---
 ### 📝 输入上下文
 
@@ -439,7 +437,7 @@ COLUMN_SELECTOR_PROMPT = """
   "reasoning": "简短说明为什么选这些表和列，以及为什么某些规则相关/不相关",
   "selected_columns": {{
     "table_name_1": ["col1", "col2"],
-    "table_name_2": ["col3", "col4"]
+    "table_name_2": ["col3", "col4", "status_col_from_rule"]
   }},
   "entity_columns": [
     {{
@@ -460,34 +458,38 @@ COLUMN_SELECTOR_PROMPT = """
       "rule_index": 1,
       "relevance": "irrelevant",
       "reason": "该规则是关于销量统计的，用户问的是销售额，不适用"
-    }},
-    {{
-      "rule_index": 2,
-      "relevance": "optional",
-      "reason": "该规则要求关联brands表，但用户没有要求品牌信息，仅作参考"
     }}
   ]
 }}
 ```
 
-### entity_columns 规则：
-1. 只提取**具体的值**（地名、产品名、状态值等），不要提取通用概念（如"订单"、"用户"）
-2. 每个值给出 1~2 个最可能的候选列
-3. 候选列**必须**出现在 selected_columns 中
-4. 如果问题中没有具体实体值，entity_columns 返回空列表 `[]`
+entity_columns 规则：
+只提取具体的值（地名、产品名、状态值等），不要提取通用概念（如"订单"、"用户"）
+每个值给出 1~2 个最可能的候选列
+候选列必须出现在 selected_columns 中
+如果问题中没有具体实体值，entity_columns 返回空列表 []
 
-### selected_rules 规则：
-1. **必须**对输入的每一条业务规则都给出判断（通过 rule_index 引用）
-2. 如果某条规则是 required，其涉及的字段必须已在 selected_columns 中
-3. 判断要基于用户的**实际查询意图**，而非规则本身的重要性
-4. 宁可多标 required，不要漏掉真正需要的规则
+selected_rules 规则：
+必须对输入的每一条业务规则都给出判断（通过 rule_index 引用）
+相关性定义：
+required: 必须遵守。规则原文中包含"必须"、"务必"、"不能"、"禁止"等强制性措辞，
+         或涉及数据过滤、金额计算等会影响结果正确性的逻辑。
+         ⚠️ 特别注意：涉及 order_status 过滤、金额字段选择(actual_amount vs total_amount)的规则，
+         只要与 orders 相关的查询，一律标记为 required。
+optional: 有参考价值，但不影响查询结果正确性的补充信息（如展示建议、命名规范等）。
+         ⚠️ optional 规则提到的字段同样必须加入 selected_columns！
+irrelevant: 与当前查询完全无关。
 
-### 注意事项
-1. **宁多勿少**：不确定时就选上（列和规则都是）
-2. **不选连接键**：user_id, order_id 这种外键不用选（图谱会自动补）
-3. **按表分组输出**
-4. **不选干扰列**：如果业务规则已明确指定某个计算字段（如"用 actual_amount 计算销售额"），
-   不要选入语义相近的替代字段（如 total_price、unit_price），以免误导下游 SQL 生成。
+#### 规则-列 强制绑定 v2（⭐⭐⭐ 不可违反）
+- 任何标记为 required 或 optional 的规则中提到的字段，**必须**出现在 selected_columns 中。
+- 如果规则提到了 actual_amount，就必须选 orders.actual_amount，**禁止**用 order_items.total_price 替代。
+- 如果规则提到了 order_status，就必须选 orders.order_status，**同时 orders 表必须被选中**。
+- 违反此规则 = 严重错误。
+
+⚠️ 最终检查清单 (Final Checklist)
+宁多勿少：不确定是否有用时，先选上该列。
+规则一致性：检查 selected_rules 中所有标记为 required/optional 的规则，它们提到的字段（如 order_status）是否都在 selected_columns 里？如果不在，立刻补上！
+不选干扰列：如果业务规则已明确指定某个计算字段（如"用 actual_amount 计算销售额"），不要选入语义相近的替代字段（如 total_price），以免误导。
 
 现在开始！
 """
@@ -507,14 +509,24 @@ GEN_SQL_PROMPT = """
 3. **日期与时间处理**：
    - 获取当前时间：使用 `NOW()` 或 `CURDATE()`。
    - 时间推算：使用 `DATE_SUB(NOW(), INTERVAL 3 MONTH)` 或 `DATE_ADD(...)`。
-   - ❌ 严禁使用 SQLite 的 `strftime` 或 `datetime(..., '-3 days')` 写法。
+   - 当用户询问 "X月之后"、"X月起" 时，**指的是包含该月，即 `>= X月01日`**。
+     绝对禁止擅自将月份往后推延1个月！例如"10月之后" 必须是 >= '10-01'，绝不能是 '11-01'。
 4. **数值计算**：
    - 涉及金额除法（如客单价）时，请使用 `NULLIF` 防止除以零：`amount / NULLIF(quantity, 0)`。
    - 货币/金额通常保留两位小数：`ROUND(val, 2)`。
 5. **字符串匹配**：
    - 模糊查询使用 `LIKE '%pattern%'`。
    - 区分大小写取决于排序规则，但通常 SQL 关键字大写，标识符小写。
-
+6. **严格的 MySQL 8.0 语法规范**
+   - 遵守 ONLY_FULL_GROUP_BY 规则：如果使用了 GROUP BY，SELECT 列表中出现的所有非聚合列（即没有被 SUM/COUNT/MAX 包裹的列），必须全部出现在 GROUP BY 子句中！
+   - 绝对不要在 SELECT 列表中使用标量子查询（Correlated Subquery），如果需要累计求和，必须使用窗口函数 `SUM(x) OVER(ORDER BY ...)`。   
+## 强制规则（生成任何SQL前必须检查）
+1. 凡涉及 orders 表的查询（包括销售额、订单统计、用户消费、购买行为），
+   必须添加 WHERE order_status NOT IN ('cancelled', 'refunded')，
+   除非题目明确要求统计"所有订单"或"取消的订单"。
+2. 凡涉及 users 表的查询，必须添加 WHERE account_status = 'active'，
+   除非题目明确要求查询全部用户（含冻结/封禁）。
+3. 计算销售额/消费金额时，使用 actual_amount 字段，不是 total_amount。
 ========================
 ### ✅ Join Hard Rules (电商数据关联法则)
 - **ID 优先**：表之间通常通过 `_id` 后缀字段连接（如 `user_id`, `order_id`, `sku_id`）。

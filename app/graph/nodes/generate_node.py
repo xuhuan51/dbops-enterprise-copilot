@@ -153,7 +153,7 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
     """
     Generator Node v2
     - 适配 value_linker 的输出
-    - 值映射信息明确注入 prompt
+    - 🔥 支持动态 Schema 切换：首次生成用精简列，修复报错用检索全列
     """
     question = state.get("question", "")
     history = state.get("history", [])
@@ -163,73 +163,82 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
     generated_sql = state.get("generated_sql")
     feedback = state.get("feedback", "")
     verified = state.get("verified", True)
+    retry_count = state.get("retry_count", 0)
 
     # ============================================================
-    # Schema 处理（不变）
+    # 🔥 1. 动态 Schema 切换 (核心改动)
     # ============================================================
+    # 判断当前是否处于修复/重试模式
+    current_error = None
+    if execution_error:
+        current_error = f"Execution Error: {execution_error}"
+    elif not verified and feedback:
+        current_error = f"Feedback: {feedback}"
 
-    selected_schema = state.get("selected_schema")
-    retrieved_columns = state.get("retrieved_columns", [])
+    is_repairing = bool(current_error and generated_sql)
+
+    # 获取两个层级的 Schema (注意：这里统一使用 state.py 中的命名)
+    selected_schema = state.get("selected_schema", {})
+    retrieved_schema = state.get("retrieved_schema", {})
 
     rich_schema_structure = {}
 
-    if selected_schema:
-        logger.info(f"🎨 [Generator] Using refined schema (Dict) directly...")
-
-        for table_name, table_data in selected_schema.items():
-            rich_schema_structure[table_name] = []
-
-            for col in table_data.get("columns", []):
-                col_name = col.get("column_name") or col.get("name")
-
-                meta = col.get("metadata", col)
-                col_info = {
-                    "type": meta.get("data_type") or meta.get("column_type", "UNKNOWN"),
-                    "comment": meta.get("column_comment") or col.get("desc", ""),
-                }
-
-                biz = meta.get("business_meaning")
-                ai_desc = meta.get("ai_description")
-                if biz:
-                    col_info["meaning"] = biz
-                elif ai_desc:
-                    col_info["description"] = ai_desc
-
-                dist = meta.get("value_distribution")
-                if dist:
-                    col_info["distribution_top5"] = dict(
-                        sorted(dist.items(), key=lambda x: x[1], reverse=True)[:5]
-                    )
-
-                rich_schema_structure[table_name].append({col_name: col_info})
+    # 根据状态决定用哪个 Schema
+    if is_repairing and retrieved_schema:
+        logger.info(
+            f"🔧 [Generator] 修复模式 (Attempt {retry_count}): 启用完整的 retrieved_schema ({len(retrieved_schema)}张表) 以防字段丢失...")
+        schema_to_use = retrieved_schema
+    elif selected_schema:
+        logger.info(f"🎨 [Generator] 首次生成: 使用精简的 selected_schema ({len(selected_schema)}张表)...")
+        schema_to_use = selected_schema
     else:
-        logger.warning(f"⚠️ [Generator] No selected schema, falling back to raw list...")
-        temp_json = _build_rich_schema_json(retrieved_columns)
-        rich_schema_structure = json.loads(temp_json)
+        logger.warning(f"⚠️ [Generator] 缺省状态: 退回使用 retrieved_schema...")
+        schema_to_use = retrieved_schema
+
+    # 统一格式化为 Rich JSON
+    for table_name, table_data in schema_to_use.items():
+        rich_schema_structure[table_name] = []
+        for col in table_data.get("columns", []):
+            col_name = col.get("column_name") or col.get("name")
+            meta = col.get("metadata", col)
+
+            col_info = {
+                "type": meta.get("data_type") or meta.get("column_type", "UNKNOWN"),
+                "comment": meta.get("column_comment") or col.get("desc", ""),
+            }
+
+            biz = meta.get("business_meaning")
+            ai_desc = meta.get("ai_description")
+            if biz:
+                col_info["meaning"] = biz
+            elif ai_desc:
+                col_info["description"] = ai_desc
+
+            dist = meta.get("value_distribution")
+            if dist:
+                col_info["distribution_top5"] = dict(
+                    sorted(dist.items(), key=lambda x: x[1], reverse=True)[:5]
+                )
+
+            rich_schema_structure[table_name].append({col_name: col_info})
 
     rich_schema_json = json.dumps(rich_schema_structure, ensure_ascii=False, indent=2)
 
     # ============================================================
-    # 🔥 值映射处理（核心改动）
+    # 2. 值映射处理 (保持不变)
     # ============================================================
-
-    # 读取 value_mappings（来自 column_selector_node → value_linker）
     value_mappings = state.get("value_mappings", [])
-
-    # 格式化为 SQL 生成器能理解的提示
-    value_mappings_str = _format_value_mappings_for_sql(value_mappings)
+    constraints_str = _format_value_mappings_for_sql(value_mappings)
 
     # ============================================================
-    # 其他上下文（保持不变）
+    # 3. 其他上下文处理 (保持不变)
     # ============================================================
-
     business_rules = state.get("business_rules", [])
     few_shot_examples = state.get("few_shot_examples", [])
     join_paths = state.get("join_paths", [])
 
     history_context = _format_history(history) if history else ""
 
-    # 1. 业务规则
     general_rules = []
     if business_rules:
         for r in business_rules:
@@ -238,14 +247,8 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
                 general_rules.append(f"- {txt.strip()}")
     rules_str = "\n".join(general_rules) if general_rules else "No specific business rules."
 
-    # 2. 值映射约束
-    # 🔥 改动: 不再用 value_matches，直接用格式化好的 value_mappings_str
-    constraints_str = value_mappings_str
-
-    # 3. Join Paths
     paths_str = "\n".join([str(p) for p in join_paths[:3]]) if join_paths else "Auto-detect based on schema FKs."
 
-    # 4. Few Shot
     few_shot_str = "No examples."
     if few_shot_examples:
         ex_lines = [
@@ -255,19 +258,13 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
         few_shot_str = "\n\n".join(ex_lines)
 
     # ============================================================
-    # Prompt 构造
+    # 4. Prompt 构造
     # ============================================================
     llm = get_llm(model_name=settings.LLM_MODEL)
     final_prompt = ""
 
-    current_error = None
-    if execution_error:
-        current_error = f"Execution Error: {execution_error}"
-    elif not verified and feedback:
-        current_error = f"Feedback: {feedback}"
-
-    if current_error and generated_sql:
-        logger.info(f"🔧 [Generator] Entering Repair Mode...")
+    if is_repairing:
+        # 这里注入的是扩展后的 rich_schema_json
         final_prompt = SQL_REPAIR_PROMPT.format(
             question=question,
             schema_context=rich_schema_json,
@@ -276,7 +273,7 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
             error_msg=current_error
         )
     else:
-        logger.info(f"🎨 [Generator] Generating from scratch...")
+        # 这里注入的是精简的 rich_schema_json
         final_prompt = GEN_SQL_PROMPT.format(
             history_context=history_context,
             schema_context=rich_schema_json,
@@ -286,6 +283,7 @@ async def generate_node(state: AgentState) -> Dict[str, Any]:
             few_shot_context=few_shot_str,
             question=question
         )
+
 
     # ============================================================
     # LLM 调用

@@ -109,7 +109,7 @@ async def execute_select_async(user_id: str, sql: str, trace_id: str = None) -> 
                 # 执行最终 SQL
                 await cur.execute(final_sql)
 
-                limit_n = getattr(settings, "RESULT_MAX_ROWS", 1000)
+                limit_n = getattr(settings, "RESULT_MAX_ROWS", 300)
                 raw_data = await cur.fetchmany(limit_n + 1)
 
                 if len(raw_data) > limit_n:
