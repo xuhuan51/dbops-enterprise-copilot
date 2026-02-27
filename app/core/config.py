@@ -1,15 +1,22 @@
 import os
+import os
 from dotenv import load_dotenv
 
-# ==========================================================
-# 🛡️ 强制网络分流 (保持不变，这部分很棒)
-# ==========================================================
-os.environ["HTTP_PROXY"] = "http://127.0.0.1:10808"
-os.environ["HTTPS_PROXY"] = "http://127.0.0.1:10808"
-os.environ["NO_PROXY"] = "127.0.0.1,localhost,11434,3306,3307,19530"
-# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 离线模式，不联网下载模型
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-print(f"📡 [Network] 代理端口已锁定为 10808，本地流量 (127.0.0.1) 已设为强制直连。")
+# 加载 .env
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(project_root, ".env"))
+
+# 代理从 .env 读，不硬编码
+proxy = os.getenv("HTTPS_PROXY", "")
+if proxy:
+    os.environ["HTTP_PROXY"] = os.getenv("HTTP_PROXY", proxy)
+    os.environ["HTTPS_PROXY"] = proxy
+    os.environ["NO_PROXY"] = os.getenv("NO_PROXY", "127.0.0.1,localhost")
+    print(f"📡 [Network] 代理已设置: {proxy}")
 
 # 加载 .env
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,7 +28,7 @@ class Settings:
     # 💾 A. 物理数据库配置 (MySQL)
     # =========================
     # 在 Docker 中，如果你是在同一个 network 下，HOST 可以填 mysql-3306
-    DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+    DB_HOST = os.getenv("DB_HOST", "mysql-3306")
     DB_PORT = int(os.getenv("DB_PORT", "3306"))
     DB_USER = os.getenv("DB_USER", "root")
     # 这里的密码要和你 docker-compose.yml 里的 MYSQL_ROOT_PASSWORD 一致
@@ -37,12 +44,12 @@ class Settings:
     # =========================
     # 🧠 B. AI & 向量库配置 (保持不变)
     # =========================
-    MILVUS_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+    MILVUS_HOST = os.getenv("MILVUS_HOST", "standalone")
     MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
     MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "rag_schema")
 
     LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
-    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434/v1")
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434/v1")
     LLM_MODEL = os.getenv("LLM_MODEL_NAME", "qwen2.5-coder:32b")
 
     EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-m3")
